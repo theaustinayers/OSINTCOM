@@ -2,6 +2,8 @@
 
 Professional-grade **voice activity detection (VAD) and recording tool** for HF radio SSB monitoring with Discord integration. Captures faint voice while rejecting static noise.
 
+![OSINTCOM GUI](screenshot.png)
+
 **Features:**
 - 🎙️ Real-time audio monitoring with visual meter
 - 🔊 Listens to **Mic In** or **Speaker Output** (WASAPI loopback on Windows)
