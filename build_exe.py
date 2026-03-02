@@ -21,6 +21,7 @@ def build():
     print("=" * 60)
     
     # PyInstaller arguments
+    manifest_path = os.path.join(project_dir, "osintcom.manifest")
     args = [
         os.path.join(project_dir, "osintcom_qt.py"),
         "--name=OSINTCOM",

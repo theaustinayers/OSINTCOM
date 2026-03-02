@@ -45,6 +45,26 @@ Download `OSINTCOM.exe` from GitHub Releases — no Python required!
 OSINTCOM.exe
 ```
 
+#### "Unknown Publisher" Warning (Windows Defender SmartScreen)
+
+When you first run `OSINTCOM.exe`, you may see a security warning:
+
+> **"Windows Defender SmartScreen prevented an unrecognized app from starting"**
+
+This is **normal and safe** — the executable is unsigned (not code-signed), which triggers SmartScreen for any first-run application.
+
+**To run the application:**
+1. Click **"More info"**
+2. Click **"Run anyway"**
+
+**Why this happens:**
+- OSINTCOM is a free, open-source tool built by the community
+- Code-signing requires a paid digital certificate
+- Open-source projects typically don't have certificates
+- SmartScreen is conservative and warns on unsigned executables
+
+**It's safe to click "Run anyway"** — the source code is available on GitHub for inspection.
+
 ---
 
 ## Usage
