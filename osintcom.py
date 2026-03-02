@@ -17,6 +17,7 @@ import sys
 import threading
 import queue
 import time
+import json
 import numpy as np
 import sounddevice as sd
 import scipy.io.wavfile as wav
@@ -26,6 +27,8 @@ from tkinter import ttk, filedialog, messagebox
 
 
 # Platform-specific imports for WASAPI loopback
+
+CONFIG_FILE = "osintcom_config.json"
 
 class OSINTCOMGUI(tk.Tk):
     def __init__(self):
@@ -37,6 +40,7 @@ class OSINTCOMGUI(tk.Tk):
         self.style = ttk.Style(self)
         self.set_dark_theme()
         self.create_widgets()
+        self.load_config()
 
     def set_dark_theme(self):
         self.style.theme_use("clam")
@@ -139,7 +143,8 @@ class OSINTCOMGUI(tk.Tk):
         for text, cmd, state in [
             ("Start", self.start_recording, "normal"),
             ("Stop", self.stop_recording, "disabled"),
-            ("File Location", self.browse_file, "normal")]:
+            ("File Location", self.browse_file, "normal"),
+            ("Save Settings", self.save_config, "normal")]:
             btn = ttk.Button(btn_frame, text=text, command=cmd, width=16)
             btn.pack(side="left", padx=12, ipadx=4, ipady=4)
             if state == "disabled":
@@ -179,7 +184,54 @@ class OSINTCOMGUI(tk.Tk):
         messagebox.showinfo("Start", "Recording started (functionality to be implemented)")
 
     def stop_recording(self):
+        self.status_var.set("Recording stopped (functionality to be implemented)")
+        messagebox.showinfo("Stop", "Recording stopped (functionality to be implemented)")
 
+    def save_config(self):
+        """Save all user settings to a JSON configuration file."""
+        config = {
+            "device": self.input_var.get(),
+            "sensitivity": self.sensitivity_var.get(),
+            "frequency": self.freq_var.get(),
+            "webhook_url": self.webhook_var.get(),
+            "custom_message": self.message_var.get(),
+            "role_id": self.role_var.get(),
+            "file_location": self.file_var.get()
+        }
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+            messagebox.showinfo("Success", "Settings saved successfully!")
+            self.status_var.set("Settings saved successfully")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
+
+    def load_config(self):
+        """Load settings from configuration file if it exists."""
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    config = json.load(f)
+                
+                # Load all settings
+                if "device" in config:
+                    self.input_var.set(config["device"])
+                if "sensitivity" in config:
+                    self.sensitivity_var.set(config["sensitivity"])
+                if "frequency" in config:
+                    self.freq_var.set(config["frequency"])
+                if "webhook_url" in config:
+                    self.webhook_var.set(config["webhook_url"])
+                if "custom_message" in config:
+                    self.message_var.set(config["custom_message"])
+                if "role_id" in config:
+                    self.role_var.set(config["role_id"])
+                if "file_location" in config:
+                    self.file_var.set(config["file_location"])
+                
+                self.status_var.set("Settings loaded from config")
+            except Exception as e:
+                print(f"Warning: Could not load config file: {str(e)}")
 
 
 def main():

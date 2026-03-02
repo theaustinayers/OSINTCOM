@@ -38,6 +38,8 @@ from PyQt5.QtGui import QFont, QPainter, QColor, QLinearGradient
 # ============================================================================
 # Constants
 # ============================================================================
+CONFIG_FILE = "osintcom_config.json"
+
 CHANNELS = 1
 BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0
@@ -221,6 +223,7 @@ class OSINTCOMWindow(QMainWindow):
         self._init_ui()
         self._connect_signals()
         self._init_timer()
+        self._load_config()
 
     def _init_ui(self):
         # Apply modern dark theme
@@ -400,9 +403,12 @@ class OSINTCOMWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.file_btn = QPushButton("File Location")
         self.file_btn.clicked.connect(self._on_file_location)
+        self.save_btn = QPushButton("Save Settings")
+        self.save_btn.clicked.connect(self._save_config)
         controls_layout.addWidget(self.start_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.file_btn)
+        controls_layout.addWidget(self.save_btn)
         layout.addWidget(controls_group)
 
         # Status Bar
@@ -765,6 +771,62 @@ class OSINTCOMWindow(QMainWindow):
 
     def _on_error(self, msg):
         QMessageBox.critical(self, "Error", msg)
+
+    def _save_config(self):
+        """Save all user settings to a JSON configuration file."""
+        config = {
+            "device": self.device_combo.currentText(),
+            "sensitivity": self.sens_slider.value(),
+            "frequency": self.freq_display.text(),
+            "webhook_url": self.webhook_edit.text(),
+            "custom_message": self.message_edit.text(),
+            "role_id": self._webhook_role_id,
+            "file_location": self._save_dir
+        }
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+            QMessageBox.information(self, "Success", "Settings saved successfully!")
+            self.status_bar.showMessage("Settings saved successfully")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save settings: {str(e)}")
+
+    def _load_config(self):
+        """Load settings from configuration file if it exists."""
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    config = json.load(f)
+                
+                # Load all settings
+                if "device" in config:
+                    index = self.device_combo.findText(config["device"])
+                    if index != -1:
+                        self.device_combo.setCurrentIndex(index)
+                
+                if "sensitivity" in config:
+                    self.sens_slider.setValue(int(config["sensitivity"]))
+                
+                if "frequency" in config:
+                    self.freq_display.setText(config["frequency"])
+                
+                if "webhook_url" in config:
+                    self.webhook_edit.setText(config["webhook_url"])
+                    self._webhook_url = config["webhook_url"]
+                
+                if "custom_message" in config:
+                    self.message_edit.setText(config["custom_message"])
+                    self._webhook_message = config["custom_message"]
+                
+                if "role_id" in config:
+                    self._webhook_role_id = config["role_id"]
+                
+                if "file_location" in config:
+                    self._save_dir = config["file_location"]
+                
+                self.status_bar.showMessage("Settings loaded from config")
+            except Exception as e:
+                print(f"Warning: Could not load config file: {str(e)}")
 
     def closeEvent(self, event):
         self._meter_timer.stop()
