@@ -48,24 +48,24 @@ MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
 VAD_SMOOTHING_WINDOW = 10
 
-# SSB-optimized sensitivity presets: detects faint voice while rejecting static
-# Tuning: Higher sensitivity = lower thresholds = more false positives (catches faint voice)
+# Optimized sensitivity presets for SSB, USB radio, and microphone inputs
+# Lower energy thresholds and better spectral analysis for weak signals
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches faintest voice, more false positives
-    1: {"spectral_flatness_max": 0.65, "vad_energy_db": -48.0, "zero_cross_threshold": 0.25,
-        "formant_prominence": 3.0, "static_suppression": 0.4, "periodicity_min": 0.35},
-    # Level 2: Relaxed - good for weak SSB signals
-    2: {"spectral_flatness_max": 0.60, "vad_energy_db": -45.0, "zero_cross_threshold": 0.30,
-        "formant_prominence": 3.5, "static_suppression": 0.35, "periodicity_min": 0.40},
-    # Level 3: Balanced (default) - recommended for most SSB
-    3: {"spectral_flatness_max": 0.55, "vad_energy_db": -42.0, "zero_cross_threshold": 0.35,
-        "formant_prominence": 4.0, "static_suppression": 0.30, "periodicity_min": 0.45},
+    # Level 1: Maximum sensitivity - catches faintest USB/radio signals
+    1: {"spectral_flatness_max": 0.70, "vad_energy_db": -56.0, "zero_cross_threshold": 0.20,
+        "formant_prominence": 2.5, "static_suppression": 0.5, "periodicity_min": 0.30},
+    # Level 2: Relaxed - good for weak SSB and USB radio
+    2: {"spectral_flatness_max": 0.65, "vad_energy_db": -52.0, "zero_cross_threshold": 0.25,
+        "formant_prominence": 3.0, "static_suppression": 0.45, "periodicity_min": 0.35},
+    # Level 3: Balanced (default) - recommended for most scenarios
+    3: {"spectral_flatness_max": 0.60, "vad_energy_db": -48.0, "zero_cross_threshold": 0.30,
+        "formant_prominence": 3.5, "static_suppression": 0.40, "periodicity_min": 0.40},
     # Level 4: Strict - rejects more false positives
-    4: {"spectral_flatness_max": 0.50, "vad_energy_db": -39.0, "zero_cross_threshold": 0.40,
-        "formant_prominence": 4.5, "static_suppression": 0.25, "periodicity_min": 0.50},
+    4: {"spectral_flatness_max": 0.55, "vad_energy_db": -44.0, "zero_cross_threshold": 0.36,
+        "formant_prominence": 4.0, "static_suppression": 0.35, "periodicity_min": 0.45},
     # Level 5: Voice only - maximum static rejection
-    5: {"spectral_flatness_max": 0.45, "vad_energy_db": -36.0, "zero_cross_threshold": 0.45,
-        "formant_prominence": 5.0, "static_suppression": 0.20, "periodicity_min": 0.55},
+    5: {"spectral_flatness_max": 0.50, "vad_energy_db": -40.0, "zero_cross_threshold": 0.42,
+        "formant_prominence": 4.5, "static_suppression": 0.30, "periodicity_min": 0.50},
 }
 
 SENSITIVITY_LABELS = {
@@ -549,11 +549,19 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> bool:
-        """SSB-optimized voice detection: rejects static, captures faint voice."""
+        """Optimized voice detection for SSB, USB radio, and microphone inputs.
+        Auto-normalizes weak signals for better detection on USB/radio sources."""
         if len(audio) < 512:
             return False
         try:
             preset = SENSITIVITY_PRESETS[self._sensitivity_level]
+            
+            # Automatic normalization for quiet signals (USB radio, weak mics)
+            rms = np.sqrt(np.mean(audio ** 2))
+            if rms > 1e-10:
+                # Normalize to -20 dB for better analysis of weak signals
+                target_rms = 10 ** (-20.0 / 20.0)  # -20 dB target
+                audio = audio * (target_rms / (rms + 1e-10))
             
             # Energy check (necessary but not sufficient)
             energy_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
@@ -580,15 +588,30 @@ class OSINTCOMWindow(QMainWindow):
             return False
     
     def _spectral_flatness(self, audio: np.ndarray) -> float:
-        """Wiener entropy: flat=1 (white noise), structured=0 (voiced). Voice has low flatness."""
+        """Enhanced spectral analysis: better discrimination for USB radio audio.
+        Flat spectrum = static/noise, peaks = voice. Returns 0-1 (lower = more voice-like)."""
         try:
             # Use Welch method for robust spectral estimate
-            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
-            # Geometric mean / Arithmetic mean
+            nperseg = min(512, len(audio))
+            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=nperseg)
+            
+            # Geometric mean / Arithmetic mean (Wiener entropy)
             pxx = np.maximum(pxx, 1e-12)  # Avoid log(0)
             geom_mean = np.exp(np.mean(np.log(pxx)))
             arith_mean = np.mean(pxx)
             flatness = geom_mean / (arith_mean + 1e-12)
+            
+            # Enhance detection: look for speech formants in 0.5-3 kHz range
+            # Voice has peaks here, static is flat
+            speech_freq_idx = np.where((freqs >= 500) & (freqs <= 3000))[0]
+            if len(speech_freq_idx) > 2:
+                speech_power = np.mean(pxx[speech_freq_idx])
+                total_power = np.mean(pxx)
+                if total_power > 0:
+                    # Voice concentrates in speech range, static spreads across spectrum
+                    speech_concentration = speech_power / (total_power + 1e-12)
+                    flatness = flatness * 0.7 + (1.0 - np.clip(speech_concentration, 0, 1)) * 0.3
+            
             return np.clip(flatness, 0.0, 1.0)
         except:
             return 0.5
@@ -602,28 +625,36 @@ class OSINTCOMWindow(QMainWindow):
             return 0.3
     
     def _pitch_periodicity(self, audio: np.ndarray) -> float:
-        """Autocorrelation-based periodicity: voice has peaks, noise doesn't.
-        Returns 0-1 where higher = more periodic (voice-like)."""
+        """Enhanced periodicity detection for weak/noisy signals like USB radio.
+        Autocorrelation-based: voice has peaks, noise doesn't. Returns 0-1 (higher = more voice-like)."""
         try:
-            # Normalize
-            audio_norm = (audio - np.mean(audio)) / (np.std(audio) + 1e-10)
+            # Normalize (handle very quiet signals)
+            std = np.std(audio)
+            if std < 1e-8:
+                # Signal too quiet, be lenient
+                return 0.4
+            audio_norm = (audio - np.mean(audio)) / (std + 1e-10)
             
-            # Autocorrelation at pitch period range (60-200 Hz = ~4-8 samples @ 44kHz)
-            max_lag = min(len(audio) // 2, 256)
+            # Autocorrelation with wider search for weak signals
+            max_lag = min(len(audio) // 2, 512)
             autocor = np.correlate(audio_norm, audio_norm, mode='full')
             autocor = autocor[len(autocor)//2:]
             autocor = autocor / (autocor[0] + 1e-10)
             
-            # Look for peaks in pitch range (100-400 Hz typical, 2-18 samples @ 44kHz)
-            pitch_range = autocor[2:18] if len(autocor) > 18 else autocor[2:]
-            if len(pitch_range) > 0:
-                periodicity = float(np.max(pitch_range))
-            else:
-                periodicity = 0.0
+            # Wider pitch range for robustness: 50-400 Hz (1-18 samples @ 44kHz)
+            # Also check 400-800 Hz for harmonics
+            pitch_range_1 = autocor[1:18] if len(autocor) > 18 else autocor[1:]
+            pitch_range_2 = autocor[18:36] if len(autocor) > 36 else []
+            
+            peak1 = np.max(pitch_range_1) if len(pitch_range_1) > 0 else 0.0
+            peak2 = np.max(pitch_range_2) if len(pitch_range_2) > 0 else 0.0
+            
+            # Combine peaks with bias toward fundamental frequency
+            periodicity = max(peak1 * 0.7 + peak2 * 0.3, peak1)
             
             return np.clip(periodicity, 0.0, 1.0)
         except:
-            return 0.3
+            return 0.35
 
     def _update_meter(self):
         db = self._peak_db
