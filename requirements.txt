@@ -1,0 +1,11 @@
+# OSINTCOM dependencies
+sounddevice
+numpy
+scipy
+pyaudio
+requests
+python-dotenv
+# For WASAPI loopback (Windows only)
+pycaw; platform_system == "Windows"
+# For denoising (optional, basic)
+noisereduce
