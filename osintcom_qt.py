@@ -48,24 +48,29 @@ MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
 VAD_SMOOTHING_WINDOW = 10
 
-# Optimized sensitivity presets for SSB, USB radio, and microphone inputs
-# Lower energy thresholds and better spectral analysis for weak signals
+# Hybrid VAD: EAM Watcher algorithms + OSINTCOM USB radio optimizations
+# Combines proven envelope/harmonicity detection with aggressive USB thresholds
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches faintest USB/radio signals
-    1: {"spectral_flatness_max": 0.70, "vad_energy_db": -56.0, "zero_cross_threshold": 0.20,
-        "formant_prominence": 2.5, "static_suppression": 0.5, "periodicity_min": 0.30},
+    # Level 1: Maximum sensitivity - catches faintest voices (EAM Watcher-tuned)
+    1: {"vad_energy_db": -56.0, "autocorr": 0.28, "flatness": 0.10,
+        "prominence": 6.0, "envelope_var": 0.005, "harmonicity": 2,
+        "crest_factor": 1.4, "smoothing_req": 5, "hold_req": 2},
     # Level 2: Relaxed - good for weak SSB and USB radio
-    2: {"spectral_flatness_max": 0.65, "vad_energy_db": -52.0, "zero_cross_threshold": 0.25,
-        "formant_prominence": 3.0, "static_suppression": 0.45, "periodicity_min": 0.35},
+    2: {"vad_energy_db": -52.0, "autocorr": 0.30, "flatness": 0.090,
+        "prominence": 7.0, "envelope_var": 0.007, "harmonicity": 2,
+        "crest_factor": 1.6, "smoothing_req": 5, "hold_req": 2},
     # Level 3: Balanced (default) - recommended for most scenarios
-    3: {"spectral_flatness_max": 0.60, "vad_energy_db": -48.0, "zero_cross_threshold": 0.30,
-        "formant_prominence": 3.5, "static_suppression": 0.40, "periodicity_min": 0.40},
+    3: {"vad_energy_db": -48.0, "autocorr": 0.33, "flatness": 0.080,
+        "prominence": 8.0, "envelope_var": 0.009, "harmonicity": 3,
+        "crest_factor": 1.8, "smoothing_req": 6, "hold_req": 2},
     # Level 4: Strict - rejects more false positives
-    4: {"spectral_flatness_max": 0.55, "vad_energy_db": -44.0, "zero_cross_threshold": 0.36,
-        "formant_prominence": 4.0, "static_suppression": 0.35, "periodicity_min": 0.45},
-    # Level 5: Voice only - maximum static rejection
-    5: {"spectral_flatness_max": 0.50, "vad_energy_db": -40.0, "zero_cross_threshold": 0.42,
-        "formant_prominence": 4.5, "static_suppression": 0.30, "periodicity_min": 0.50},
+    4: {"vad_energy_db": -44.0, "autocorr": 0.36, "flatness": 0.070,
+        "prominence": 9.0, "envelope_var": 0.012, "harmonicity": 3,
+        "crest_factor": 2.0, "smoothing_req": 7, "hold_req": 3},
+    # Level 5: Voice only - maximum static rejection (strictest)
+    5: {"vad_energy_db": -40.0, "autocorr": 0.40, "flatness": 0.060,
+        "prominence": 10.0, "envelope_var": 0.015, "harmonicity": 4,
+        "crest_factor": 2.2, "smoothing_req": 8, "hold_req": 3},
 }
 
 SENSITIVITY_LABELS = {
@@ -179,6 +184,80 @@ class WebhookCustomizeDialog(QDialog):
     def get_message_template(self) -> str:
         return self.msg_edit.toPlainText().strip()
 
+class AudioSettingsDialog(QDialog):
+    """Dialog for configuring audio processing options."""
+    def __init__(self, current_settings: dict = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Audio Processing Settings")
+        self.setMinimumWidth(500)
+        
+        self.settings = current_settings or {}
+        
+        layout = QVBoxLayout(self)
+        
+        # Bandpass Filter
+        layout.addWidget(QLabel("Audio Processing Options:", font=QFont("Segoe UI", 11, QFont.Bold)))
+        layout.addSpacing(8)
+        
+        self.use_bandpass_chk = QCheckBox("Use Bandpass Filter (300-3000 Hz for SSB)")
+        self.use_bandpass_chk.setChecked(self.settings.get("use_bandpass", False))
+        self.use_bandpass_chk.setToolTip("Removes static outside speech frequency range")
+        layout.addWidget(self.use_bandpass_chk)
+        
+        # Enhanced Denoise
+        self.use_denoise_chk = QCheckBox("Enhanced Noise Reduction")
+        self.use_denoise_chk.setChecked(self.settings.get("use_denoise", True))
+        self.use_denoise_chk.setToolTip("Apply aggressive noise reduction (slower)")
+        layout.addWidget(self.use_denoise_chk)
+        
+        # Denoise strength slider
+        denoise_layout = QHBoxLayout()
+        denoise_layout.addWidget(QLabel("Denoise Strength:"))
+        self.denoise_strength = QSlider(Qt.Horizontal)
+        self.denoise_strength.setMinimum(1)
+        self.denoise_strength.setMaximum(10)
+        self.denoise_strength.setValue(self.settings.get("denoise_strength", 6))
+        self.denoise_strength.setTickPosition(QSlider.TicksBelow)
+        self.denoise_strength.setTickInterval(1)
+        denoise_layout.addWidget(self.denoise_strength)
+        self.denoise_label = QLabel(str(self.settings.get("denoise_strength", 6)))
+        denoise_layout.addWidget(self.denoise_label)
+        self.denoise_strength.valueChanged.connect(lambda v: self.denoise_label.setText(str(v)))
+        layout.addLayout(denoise_layout)
+        layout.addSpacing(8)
+        
+        # Silence Removal
+        self.remove_silence_chk = QCheckBox("Remove Silent Gaps")
+        self.remove_silence_chk.setChecked(self.settings.get("remove_silence", False))
+        self.remove_silence_chk.setToolTip("Remove quiet periods between speech bursts")
+        layout.addWidget(self.remove_silence_chk)
+        
+        # Voice Extraction
+        self.voice_extract_chk = QCheckBox("Voice-Only Extraction (Speech Bursts Only)")
+        self.voice_extract_chk.setChecked(self.settings.get("voice_extract", False))
+        self.voice_extract_chk.setToolTip("Send only clear voice segments, remove all background")
+        layout.addWidget(self.voice_extract_chk)
+        
+        layout.addSpacing(12)
+        layout.addWidget(QLabel("ℹ️ Voice-Only mode sends cleanest audio but may cut very quiet voices.", 
+                               font=QFont("Segoe UI", 9)))
+        
+        layout.addStretch()
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_settings(self) -> dict:
+        return {
+            "use_bandpass": self.use_bandpass_chk.isChecked(),
+            "use_denoise": self.use_denoise_chk.isChecked(),
+            "denoise_strength": self.denoise_strength.value(),
+            "remove_silence": self.remove_silence_chk.isChecked(),
+            "voice_extract": self.voice_extract_chk.isChecked(),
+        }
+
 # ============================================================================
 # Main Window
 # ============================================================================
@@ -217,6 +296,15 @@ class OSINTCOMWindow(QMainWindow):
         self._frequency = ""
         self._save_dir = os.path.join(os.path.expanduser("~"), "Documents", "OSINTCOM")
         self._signals = WorkerSignals()
+        
+        # Audio processing settings
+        self._audio_settings = {
+            "use_bandpass": False,
+            "use_denoise": True,
+            "denoise_strength": 6,
+            "remove_silence": False,
+            "voice_extract": False,
+        }
         
         os.makedirs(self._save_dir, exist_ok=True)
         
@@ -403,11 +491,14 @@ class OSINTCOMWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.file_btn = QPushButton("File Location")
         self.file_btn.clicked.connect(self._on_file_location)
+        self.audio_settings_btn = QPushButton("Audio Settings")
+        self.audio_settings_btn.clicked.connect(self._open_audio_settings)
         self.save_btn = QPushButton("Save Settings")
         self.save_btn.clicked.connect(self._save_config)
         controls_layout.addWidget(self.start_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.file_btn)
+        controls_layout.addWidget(self.audio_settings_btn)
         controls_layout.addWidget(self.save_btn)
         layout.addWidget(controls_group)
 
@@ -482,6 +573,12 @@ class OSINTCOMWindow(QMainWindow):
             self._webhook_message = dlg.get_message_template()
             self.message_edit.setText(self._webhook_message[:40] + "..." if len(self._webhook_message) > 40 else self._webhook_message)
 
+    def _open_audio_settings(self):
+        """Open audio processing settings dialog."""
+        dlg = AudioSettingsDialog(self._audio_settings, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._audio_settings = dlg.get_settings()
+
     def _on_file_location(self):
         path = QFileDialog.getExistingDirectory(self, "Select Save Directory", self._save_dir)
         if path:
@@ -549,73 +646,165 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> bool:
-        """Optimized voice detection for SSB, USB radio, and microphone inputs.
-        Auto-normalizes weak signals for better detection on USB/radio sources."""
+        """Hybrid VAD combining EAM Watcher reliability with USB radio optimization.
+        Uses envelope variance, harmonicity, crest factor, and spectral analysis."""
         if len(audio) < 512:
             return False
         try:
             preset = SENSITIVITY_PRESETS[self._sensitivity_level]
             
-            # Automatic normalization for quiet signals (USB radio, weak mics)
+            # 1. AUTO-NORMALIZATION for weak signals (USB radio)
             rms = np.sqrt(np.mean(audio ** 2))
             if rms > 1e-10:
-                # Normalize to -20 dB for better analysis of weak signals
-                target_rms = 10 ** (-20.0 / 20.0)  # -20 dB target
+                target_rms = 10 ** (-20.0 / 20.0)
                 audio = audio * (target_rms / (rms + 1e-10))
             
-            # Energy check (necessary but not sufficient)
+            # 2. ENERGY CHECK (gate)
             energy_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
             if energy_db < preset["vad_energy_db"]:
                 return False
             
-            # Spectral flatness: Static = flat spectrum (high flatness); Voice = peaks (low flatness)
+            # 3. SPECTRAL FLATNESS (EAM: static = flat, voice = peaks)
             flatness = self._spectral_flatness(audio)
-            if flatness > preset["spectral_flatness_max"]:
-                return False  # Too flat = static
+            if flatness > preset["flatness"]:
+                return False
             
-            # Zero-crossing rate: Voice has moderate ZCR; pure static has very high ZCR
-            zcr = self._zero_crossing_rate(audio)
-            if zcr < preset["zero_cross_threshold"]:
-                return False  # Too low ZCR = not speech
+            # 4. AUTOCORRELATION (periodicity) - EAM proven method
+            autocorr = self._autocorrelation_periodicity(audio)
+            if autocorr < preset["autocorr"]:
+                return False
             
-            # Formant/pitch detection: Voice has periodic energy; static = noise
-            periodicity = self._pitch_periodicity(audio)
-            if periodicity < preset["periodicity_min"]:
-                return False  # Not enough periodicity = noise
+            # 5. ENVELOPE VARIANCE (EAM: voice = modulated, static = flat)
+            env_var = self._envelope_variance(audio)
+            if env_var < preset["envelope_var"]:
+                return False
+            
+            # 6. HARMONICITY (EAM: voice has harmonic structure, noise doesn't)
+            harmonicity = self._harmonicity_score(audio)
+            if harmonicity < preset["harmonicity"]:
+                return False
+            
+            # 7. CREST FACTOR (EAM: voice has peaks, noise = flat)
+            crest = self._crest_factor(audio)
+            if crest < preset["crest_factor"]:
+                return False
             
             return True
         except Exception:
             return False
     
     def _spectral_flatness(self, audio: np.ndarray) -> float:
-        """Enhanced spectral analysis: better discrimination for USB radio audio.
-        Flat spectrum = static/noise, peaks = voice. Returns 0-1 (lower = more voice-like)."""
+        """Wiener entropy: flat=1 (white noise), structured=0 (voiced). Voice has low flatness."""
         try:
-            # Use Welch method for robust spectral estimate
-            nperseg = min(512, len(audio))
-            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=nperseg)
-            
-            # Geometric mean / Arithmetic mean (Wiener entropy)
-            pxx = np.maximum(pxx, 1e-12)  # Avoid log(0)
+            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
+            pxx = np.maximum(pxx, 1e-12)
             geom_mean = np.exp(np.mean(np.log(pxx)))
             arith_mean = np.mean(pxx)
             flatness = geom_mean / (arith_mean + 1e-12)
-            
-            # Enhance detection: look for speech formants in 0.5-3 kHz range
-            # Voice has peaks here, static is flat
-            speech_freq_idx = np.where((freqs >= 500) & (freqs <= 3000))[0]
-            if len(speech_freq_idx) > 2:
-                speech_power = np.mean(pxx[speech_freq_idx])
-                total_power = np.mean(pxx)
-                if total_power > 0:
-                    # Voice concentrates in speech range, static spreads across spectrum
-                    speech_concentration = speech_power / (total_power + 1e-12)
-                    flatness = flatness * 0.7 + (1.0 - np.clip(speech_concentration, 0, 1)) * 0.3
-            
             return np.clip(flatness, 0.0, 1.0)
         except:
             return 0.5
-    
+
+    def _autocorrelation_periodicity(self, audio: np.ndarray) -> float:
+        """Autocorrelation-based periodicity detection. Voice has peaks, noise is flat."""
+        try:
+            std = np.std(audio)
+            if std < 1e-8:
+                return 0.4
+            audio_norm = (audio - np.mean(audio)) / (std + 1e-10)
+            
+            # Autocorrelation at pitch period (60-200 Hz typical for speech)
+            autocor = np.correlate(audio_norm, audio_norm, mode='full')
+            autocor = autocor[len(autocor)//2:]
+            autocor = autocor / (autocor[0] + 1e-10)
+            
+            # Search pitch range (2-18 samples @ 44kHz = ~100-400 Hz)
+            pitch_range = autocor[2:18] if len(autocor) > 18 else autocor[2:]
+            periodicity = np.max(pitch_range) if len(pitch_range) > 0 else 0.0
+            
+            return np.clip(periodicity, 0.0, 1.0)
+        except:
+            return 0.3
+
+    def _envelope_variance(self, audio: np.ndarray) -> float:
+        """Detects syllabic modulation: voice has varying envelope, static is flat.
+        Uses Hilbert transform to extract amplitude envelope."""
+        try:
+            from scipy.signal import hilbert
+            
+            # Get instantaneous amplitude via Hilbert transform
+            analytical = hilbert(audio)
+            envelope = np.abs(analytical)
+            
+            # Normalize envelope
+            env_mean = np.mean(envelope)
+            if env_mean < 1e-10:
+                return 0.0
+            
+            # Variance in normalized envelope (voice > 0.005, static < 0.001)
+            normalized_env = envelope / (env_mean + 1e-10)
+            variance = np.var(normalized_env)
+            
+            return np.clip(variance, 0.0, 1.0)
+        except:
+            return 0.005
+
+    def _harmonicity_score(self, audio: np.ndarray) -> float:
+        """Detects harmonic structure: voice has harmonics, noise is inharmonic.
+        Returns 0-1 where higher = more harmonic (voice-like)."""
+        try:
+            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
+            
+            if len(pxx) < 10:
+                return 0.3
+            
+            # Find peaks in power spectrum (potential harmonics)
+            threshold = np.mean(pxx) + np.std(pxx)
+            peaks = np.where(pxx > threshold)[0]
+            
+            if len(peaks) < 2:
+                return 0.0
+            
+            # Check if peaks are spaced harmonically (multiples of fundamental)
+            peak_freqs = freqs[peaks]
+            fundamental = peak_freqs[0] if len(peak_freqs) > 0 else 100
+            
+            if fundamental < 50:
+                return 0.0
+            
+            # Count harmonics (peaks at ~2f, ~3f, ~4f, etc.)
+            harmonic_count = 0
+            for i in range(2, 5):  # Check 2nd, 3rd, 4th harmonics
+                harmonic_freq = fundamental * i
+                # Allow ±20% tolerance
+                matches = np.sum((peak_freqs >= harmonic_freq * 0.8) & 
+                                (peak_freqs <= harmonic_freq * 1.2))
+                harmonic_count += matches
+            
+            # Harmonicity: ratio of detected harmonics (0-1)
+            harmonicity = harmonic_count / 3.0  # max 3 harmonics checked
+            return np.clip(harmonicity, 0.0, 1.0)
+        except:
+            return 0.3
+
+    def _crest_factor(self, audio: np.ndarray) -> float:
+        """Peak-to-RMS ratio: voice has defined peaks, noise is flat.
+        Voice: 1.5-2.2, Static: 1.0-1.2"""
+        try:
+            rms = np.sqrt(np.mean(audio ** 2))
+            if rms < 1e-10:
+                return 0.0
+            
+            peak = np.max(np.abs(audio))
+            crest = peak / (rms + 1e-10)
+            
+            # Normalize: 1.0 = no peaks (noise), 2.5+ = strong peaks (voice)
+            # Map to 0-1: crest 1.0 -> 0.0, crest 2.5 -> 1.0
+            normalized = (crest - 1.0) / 1.5
+            return np.clip(normalized, 0.0, 1.0)
+        except:
+            return 1.0
+
     def _zero_crossing_rate(self, audio: np.ndarray) -> float:
         """Normalized zero-crossing rate. Voice typically 0.1-0.5; static > 0.5."""
         try:
@@ -655,6 +844,122 @@ class OSINTCOMWindow(QMainWindow):
             return np.clip(periodicity, 0.0, 1.0)
         except:
             return 0.35
+
+    # ============================================================================
+    # Audio Processing Methods
+    # ============================================================================
+    
+    def _process_audio(self, audio: np.ndarray) -> np.ndarray:
+        """Apply audio processing filters based on user settings."""
+        processed = audio.copy()
+        
+        # 1. Bandpass filter (300-3000 Hz SSB speech)
+        if self._audio_settings.get("use_bandpass", False):
+            processed = self._apply_bandpass_filter(processed)
+        
+        # 2. Enhanced denoising
+        if self._audio_settings.get("use_denoise", True):
+            strength = self._audio_settings.get("denoise_strength", 6)
+            processed = self._apply_enhanced_denoise(processed, strength)
+        
+        # 3. Voice extraction (keep only clear voice segments)
+        if self._audio_settings.get("voice_extract", False):
+            processed = self._extract_voice_only(processed)
+        
+        # 4. Silence removal (optional)
+        if self._audio_settings.get("remove_silence", False):
+            processed = self._remove_silence_gaps(processed)
+        
+        return processed
+    
+    def _apply_bandpass_filter(self, audio: np.ndarray) -> np.ndarray:
+        """Apply bandpass filter 300-3000 Hz for SSB speech."""
+        try:
+            # Butterworth bandpass
+            sos = butter(4, [300, 3000], btype='band', fs=self._sample_rate, output='sos')
+            filtered = sosfiltfilt(sos, audio)
+            return filtered
+        except:
+            return audio
+    
+    def _apply_enhanced_denoise(self, audio: np.ndarray, strength: int) -> np.ndarray:
+        """Apply enhanced noise reduction."""
+        if not HAS_NOISEREDUCE:
+            return audio
+        
+        try:
+            # Map strength 1-10 to noise reduction parameters
+            # Higher strength = more aggressive denoising
+            prop_decrease = 0.4 + (strength / 10.0) * 0.5  # 0.4 to 0.9
+            
+            # Use noisereduce with aggressive settings
+            reduced = nr.reduce_noise(
+                y=audio,
+                sr=self._sample_rate,
+                prop_decrease=prop_decrease,
+                n_fft=512,
+                stationary=True
+            )
+            
+            return reduced
+        except:
+            return audio
+    
+    def _extract_voice_only(self, audio: np.ndarray) -> np.ndarray:
+        """Extract only clear voice segments using VAD, silence the rest."""
+        try:
+            # Process in chunks
+            chunk_size = BLOCK_SIZE
+            voice_audio = np.zeros_like(audio)
+            
+            for i in range(0, len(audio), chunk_size):
+                end = min(i + chunk_size, len(audio))
+                chunk = audio[i:end]
+                
+                # Use VAD to detect if this chunk is voice
+                if self._detect_voice(chunk):
+                    voice_audio[i:end] = chunk
+            
+            return voice_audio
+        except:
+            return audio
+    
+    def _remove_silence_gaps(self, audio: np.ndarray) -> np.ndarray:
+        """Remove silent gaps between speech bursts."""
+        try:
+            from scipy.signal import find_peaks
+            
+            # Detect silence threshold (10% of max amplitude)
+            threshold = 0.1 * np.max(np.abs(audio))
+            
+            # Find regions above threshold
+            above_threshold = np.abs(audio) > threshold
+            
+            # Remove small isolated peaks (noise)
+            chunk_size = int(0.05 * self._sample_rate)  # 50ms minimum
+            
+            # Simple approach: keep consecutive samples above threshold
+            result = np.zeros_like(audio)
+            in_speech = False
+            speech_start = 0
+            
+            for i in range(len(above_threshold)):
+                if above_threshold[i] and not in_speech:
+                    speech_start = i
+                    in_speech = True
+                elif not above_threshold[i] and in_speech:
+                    # End of speech burst
+                    if i - speech_start > chunk_size:
+                        result[speech_start:i] = audio[speech_start:i]
+                    in_speech = False
+            
+            # Handle final burst
+            if in_speech and len(above_threshold) - speech_start > chunk_size:
+                result[speech_start:] = audio[speech_start:]
+            
+            return result
+        except:
+            return audio
 
     def _update_meter(self):
         db = self._peak_db
@@ -741,12 +1046,8 @@ class OSINTCOMWindow(QMainWindow):
             if max_val > 0:
                 audio_data = audio_data / max_val * 0.95
             
-            # Denoise if available and enabled
-            if self.denoise_check.isChecked() and HAS_NOISEREDUCE:
-                try:
-                    audio_data = nr.reduce_noise(y=audio_data, sr=self._sample_rate, stationary=True, prop_decrease=0.6)
-                except Exception as denoise_err:
-                    self._signals.error.emit(f"Denoising warning: {denoise_err}")
+            # Apply audio processing (bandpass, denoise, voice extraction, etc.)
+            audio_data = self._process_audio(audio_data)
             
             # Write WAV with Windows-safe filename (no colons)
             timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -812,7 +1113,8 @@ class OSINTCOMWindow(QMainWindow):
             "webhook_url": self.webhook_edit.text(),
             "custom_message": self.message_edit.text(),
             "role_id": self._webhook_role_id,
-            "file_location": self._save_dir
+            "file_location": self._save_dir,
+            "audio_settings": self._audio_settings
         }
         try:
             with open(CONFIG_FILE, "w") as f:
@@ -854,6 +1156,9 @@ class OSINTCOMWindow(QMainWindow):
                 
                 if "file_location" in config:
                     self._save_dir = config["file_location"]
+                
+                if "audio_settings" in config:
+                    self._audio_settings.update(config["audio_settings"])
                 
                 self.status_bar.showMessage("Settings loaded from config")
             except Exception as e:
