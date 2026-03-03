@@ -48,29 +48,31 @@ MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
 VAD_SMOOTHING_WINDOW = 10
 
-# Hybrid VAD: EAM Watcher algorithms + OSINTCOM USB radio optimizations
-# Combines proven envelope/harmonicity detection with aggressive USB thresholds
+# Hybrid VAD: EAM Watcher algorithms + Adaptive Noise Floor Learning
+# Learns actual noise floor during first 3 seconds, then sets thresholds intelligently
+# Voice detection: Energy + Spectral Features for low SNR discrimination
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches faintest voices (EAM Watcher-tuned)
-    1: {"vad_energy_db": -56.0, "autocorr": 0.28, "flatness": 0.10,
-        "prominence": 6.0, "envelope_var": 0.005, "harmonicity": 2,
-        "crest_factor": 1.4, "smoothing_req": 5, "hold_req": 2},
-    # Level 2: Relaxed - good for weak SSB and USB radio
-    2: {"vad_energy_db": -52.0, "autocorr": 0.30, "flatness": 0.090,
-        "prominence": 7.0, "envelope_var": 0.007, "harmonicity": 2,
-        "crest_factor": 1.6, "smoothing_req": 5, "hold_req": 2},
-    # Level 3: Balanced (default) - recommended for most scenarios
-    3: {"vad_energy_db": -48.0, "autocorr": 0.33, "flatness": 0.080,
-        "prominence": 8.0, "envelope_var": 0.009, "harmonicity": 3,
-        "crest_factor": 1.8, "smoothing_req": 6, "hold_req": 2},
-    # Level 4: Strict - rejects more false positives
-    4: {"vad_energy_db": -44.0, "autocorr": 0.36, "flatness": 0.070,
-        "prominence": 9.0, "envelope_var": 0.012, "harmonicity": 3,
-        "crest_factor": 2.0, "smoothing_req": 7, "hold_req": 3},
-    # Level 5: Voice only - maximum static rejection (strictest)
-    5: {"vad_energy_db": -40.0, "autocorr": 0.40, "flatness": 0.060,
-        "prominence": 10.0, "envelope_var": 0.015, "harmonicity": 4,
-        "crest_factor": 2.2, "smoothing_req": 8, "hold_req": 3},
+    # Level 1: Maximum sensitivity - catches faintest voices just above noise floor
+    # db_above_noise_floor: how far above learned noise to trigger
+    1: {"db_above_noise": 2.0, "autocorr": 0.05, "flatness": 0.70,
+        "prominence": 6.0, "envelope_var": 0.0, "harmonicity": 0.0,
+        "crest_factor": 0.0, "smoothing_req": 5, "hold_req": 2},
+    # Level 2: Very sensitive - adds slight spectral filtering
+    2: {"db_above_noise": 3.0, "autocorr": 0.08, "flatness": 0.65,
+        "prominence": 7.0, "envelope_var": 0.0, "harmonicity": 0.0,
+        "crest_factor": 0.2, "smoothing_req": 5, "hold_req": 2},
+    # Level 3: Balanced (default) - some noise rejection
+    3: {"db_above_noise": 4.0, "autocorr": 0.10, "flatness": 0.60,
+        "prominence": 8.0, "envelope_var": 0.001, "harmonicity": 0.0,
+        "crest_factor": 0.5, "smoothing_req": 6, "hold_req": 2},
+    # Level 4: Strict - better noise rejection
+    4: {"db_above_noise": 5.0, "autocorr": 0.15, "flatness": 0.50,
+        "prominence": 9.0, "envelope_var": 0.002, "harmonicity": 0.5,
+        "crest_factor": 0.8, "smoothing_req": 7, "hold_req": 3},
+    # Level 5: Voice only - maximum static rejection
+    5: {"db_above_noise": 6.0, "autocorr": 0.20, "flatness": 0.40,
+        "prominence": 10.0, "envelope_var": 0.004, "harmonicity": 1.0,
+        "crest_factor": 1.2, "smoothing_req": 8, "hold_req": 3},
 }
 
 SENSITIVITY_LABELS = {
@@ -296,6 +298,16 @@ class OSINTCOMWindow(QMainWindow):
         self._frequency = ""
         self._save_dir = os.path.join(os.path.expanduser("~"), "Documents", "OSINTCOM")
         self._signals = WorkerSignals()
+        
+        # Adaptive noise floor learning
+        self._noise_floor_db = -25.0  # Initial estimate
+        self._noise_samples = collections.deque(maxlen=100)  # Last 100 samples
+        self._noise_learning_time = 3.0  # Learn for 3 seconds on startup
+        self._noise_relearn_interval = 240.0  # Re-learn every 4 minutes (240 seconds)
+        self._last_learning_time = time.time()
+        self._last_relearn_time = time.time()
+        self._learning_enabled = True
+        self._learning_phase = "startup"  # "startup" or "periodic"
         
         # Audio processing settings
         self._audio_settings = {
@@ -592,6 +604,10 @@ class OSINTCOMWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please configure Discord webhook first.")
             return
         self._running = True
+        self._learning_phase = "startup"  # Start with initial learning
+        self._last_learning_time = time.time()
+        self._last_relearn_time = time.time()
+        self._noise_samples.clear()
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._meter_timer.start()
@@ -646,51 +662,115 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> bool:
-        """Hybrid VAD combining EAM Watcher reliability with USB radio optimization.
-        Uses envelope variance, harmonicity, crest factor, and spectral analysis."""
+        """Hybrid VAD with Adaptive Noise Floor Learning.
+        Learns the actual noise floor during first 3 seconds, then detects voice intelligently."""
         if len(audio) < 512:
             return False
         try:
             preset = SENSITIVITY_PRESETS[self._sensitivity_level]
+            debug = False  # Disable debug logging for production
             
-            # 1. AUTO-NORMALIZATION for weak signals (USB radio)
-            rms = np.sqrt(np.mean(audio ** 2))
-            if rms > 1e-10:
-                target_rms = 10 ** (-20.0 / 20.0)
-                audio = audio * (target_rms / (rms + 1e-10))
-            
-            # 2. ENERGY CHECK (gate)
+            # Calculate energy
             energy_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
-            if energy_db < preset["vad_energy_db"]:
+            
+            # ===== NOISE FLOOR LEARNING (first 3 seconds) =====
+            if self._learning_phase == "startup":
+                elapsed = time.time() - self._last_learning_time
+                if elapsed < self._noise_learning_time:
+                    # During learning phase, collect quiet samples to estimate noise floor
+                    if energy_db < -20:  # Likely noise, not voice
+                        self._noise_samples.append(energy_db)
+                    
+                    # Update learned noise floor (median of collected samples)
+                    if len(self._noise_samples) > 10:
+                        self._noise_floor_db = np.median(list(self._noise_samples))
+                        if debug and elapsed % 1.0 < 0.05:  # Print every ~1 second
+                            print(f"[Startup Learning] Noise floor: {self._noise_floor_db:.1f} dB ({len(self._noise_samples)} samples)")
+                else:
+                    # Startup learning complete
+                    self._learning_phase = "periodic"
+                    if len(self._noise_samples) > 0:
+                        self._noise_floor_db = np.median(list(self._noise_samples))
+                    print(f"✓ Startup learning complete: Noise floor = {self._noise_floor_db:.1f} dB")
+                    print(f"  Will trigger on signals > {self._noise_floor_db + preset['db_above_noise']:.1f} dB")
+                    print(f"  Will re-learn every {self._noise_relearn_interval/60:.0f} minutes during silence")
+                    self._last_relearn_time = time.time()
+            
+            # ===== PERIODIC NOISE FLOOR RE-LEARNING (every 4 minutes) =====
+            # Only re-learn during silence (not recording), to adapt to propagation changes
+            elif self._learning_phase == "periodic" and not self._recording:
+                time_since_relearn = time.time() - self._last_relearn_time
+                
+                if time_since_relearn >= self._noise_relearn_interval:
+                    # Start a new learning cycle (collect for 0.5 seconds)
+                    if energy_db < -20:  # Likely noise
+                        self._noise_samples.append(energy_db)
+                    
+                    if len(self._noise_samples) > 5:
+                        old_floor = self._noise_floor_db
+                        self._noise_floor_db = np.median(list(self._noise_samples))
+                        self._noise_samples.clear()
+                        self._last_relearn_time = time.time()
+                        if self._noise_floor_db != old_floor:
+                            print(f"[Periodic Re-learn] Noise floor updated: {old_floor:.1f} dB → {self._noise_floor_db:.1f} dB (propagation change)")
+                            print(f"  Threshold now: {self._noise_floor_db + preset['db_above_noise']:.1f} dB")
+                
+                elif time_since_relearn > self._noise_relearn_interval + 5.0:
+                    # If we've been over threshold for too long without collecting samples, reset
+                    self._noise_samples.clear()
+                    self._last_relearn_time = time.time()
+                    if debug:
+                        print(f"[Periodic Re-learn] Reset at {time_since_relearn:.0f}s for next cycle")
+            
+            # ===== VOICE DETECTION AFTER LEARNING =====
+            # 1. ENERGY CHECK relative to learned noise floor
+            threshold_db = self._noise_floor_db + preset["db_above_noise"]
+            if energy_db < threshold_db:
+                if debug and self._learning_phase == "periodic":
+                    print(f"VAD FAIL: Energy {energy_db:.1f} dB < threshold {threshold_db:.1f} dB (noise floor {self._noise_floor_db:.1f} + {preset['db_above_noise']:.1f})")
                 return False
             
-            # 3. SPECTRAL FLATNESS (EAM: static = flat, voice = peaks)
+            # 2. SPECTRAL FLATNESS - reject pure noise (even if loud)
+            # Pure noise = high flatness, voice = low flatness
             flatness = self._spectral_flatness(audio)
             if flatness > preset["flatness"]:
+                if debug and self._learning_phase == "periodic":
+                    print(f"VAD FAIL: Flatness {flatness:.4f} > {preset['flatness']:.4f} (noise-like spectrum)")
                 return False
             
-            # 4. AUTOCORRELATION (periodicity) - EAM proven method
+            # 3. AUTOCORRELATION periodicty - voice has pitch structure
             autocorr = self._autocorrelation_periodicity(audio)
             if autocorr < preset["autocorr"]:
+                if debug and self._learning_phase == "periodic":
+                    print(f"VAD FAIL: Autocorr {autocorr:.3f} < {preset['autocorr']:.3f} (no pitch structure)")
                 return False
             
-            # 5. ENVELOPE VARIANCE (EAM: voice = modulated, static = flat)
+            # 4. ENVELOPE VARIANCE - voice modulates, static doesn't
             env_var = self._envelope_variance(audio)
             if env_var < preset["envelope_var"]:
+                if debug and self._learning_phase == "periodic":
+                    print(f"VAD FAIL: Env.Var {env_var:.6f} < {preset['envelope_var']:.6f} (too steady)")
                 return False
             
-            # 6. HARMONICITY (EAM: voice has harmonic structure, noise doesn't)
+            # 5. HARMONICITY - voice has harmonic content
             harmonicity = self._harmonicity_score(audio)
             if harmonicity < preset["harmonicity"]:
+                if debug and self._learning_phase == "periodic":
+                    print(f"VAD FAIL: Harmonicity {harmonicity:.2f} < {preset['harmonicity']:.2f} (inharmonic)")
                 return False
             
-            # 7. CREST FACTOR (EAM: voice has peaks, noise = flat)
+            # 6. CREST FACTOR - voice has peaks, static is flat
             crest = self._crest_factor(audio)
             if crest < preset["crest_factor"]:
+                if debug and self._learning_phase == "periodic":
+                    print(f"VAD FAIL: Crest {crest:.2f} < {preset['crest_factor']:.2f} (flat)")
                 return False
             
+            if debug and self._learning_phase == "periodic":
+                print(f"✓ VOICE: E={energy_db:.1f}dB (thr={threshold_db:.1f}) F={flatness:.3f} A={autocorr:.2f} EV={env_var:.5f} H={harmonicity:.1f} C={crest:.1f}")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"VAD Exception: {e}")
             return False
     
     def _spectral_flatness(self, audio: np.ndarray) -> float:
