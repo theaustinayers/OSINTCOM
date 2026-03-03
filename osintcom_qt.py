@@ -43,10 +43,11 @@ CONFIG_FILE = "osintcom_config.json"
 CHANNELS = 1
 BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0
-VOICE_SILENCE_TAIL = 10.0
+VOICE_SILENCE_TAIL = 3.0  # Reduced from 10s to stop recording faster
 MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
-VAD_SMOOTHING_WINDOW = 10
+VAD_SMOOTHING_WINDOW = 4  # Reduced from 10 to 4 for faster silence detection
+VAD_ENERGY_DROP_THRESHOLD = 5.0  # dB drop that indicates end of voice
 
 # Hybrid VAD: EAM Watcher algorithms + Adaptive Noise Floor Learning
 # Learns actual noise floor during first 3 seconds, then sets thresholds intelligently
@@ -292,6 +293,7 @@ class OSINTCOMWindow(QMainWindow):
         self._voice_silence_at = None
         self._silence_timer_remaining = 0
         self._sensitivity_level = 3
+        self._previous_energy_db = -60.0  # Track energy for drop-off detection
         self._webhook_url = ""
         self._webhook_role_id = ""
         self._webhook_message = "EMERGENCY ACTION MESSAGE INCOMING"
@@ -567,6 +569,7 @@ class OSINTCOMWindow(QMainWindow):
     def _on_freq_selected(self, freq):
         self._frequency = str(freq)
         self.freq_display.setText(f"{freq:.0f} kHz")
+        self._save_config()  # Auto-save frequency
 
     def _on_sensitivity_changed(self, value):
         self._sensitivity_level = value
@@ -577,6 +580,7 @@ class OSINTCOMWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             self._webhook_url = dlg.get_url()
             self.webhook_edit.setText(self._webhook_url[:50] + "..." if len(self._webhook_url) > 50 else self._webhook_url)
+            self._save_config()  # Auto-save webhook
 
     def _open_customize_dialog(self):
         dlg = WebhookCustomizeDialog(self._webhook_role_id, self._webhook_message, self)
@@ -584,6 +588,7 @@ class OSINTCOMWindow(QMainWindow):
             self._webhook_role_id = dlg.get_role_id()
             self._webhook_message = dlg.get_message_template()
             self.message_edit.setText(self._webhook_message[:40] + "..." if len(self._webhook_message) > 40 else self._webhook_message)
+            self._save_config()  # Auto-save customize
 
     def _open_audio_settings(self):
         """Open audio processing settings dialog."""
@@ -1054,6 +1059,14 @@ class OSINTCOMWindow(QMainWindow):
         
         if current_chunk is not None:
             voice = self._detect_voice(current_chunk)
+            
+            # Check for energy drop-off (indicates end of voice)
+            energy_drop = self._previous_energy_db - db
+            if self._recording and energy_drop > VAD_ENERGY_DROP_THRESHOLD:
+                # Sudden energy drop = likely end of voice, force silence
+                voice = False
+            self._previous_energy_db = db
+            
             self._voice_history.append(voice)
             detected = sum(self._voice_history) > len(self._voice_history) / 2
             
