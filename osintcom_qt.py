@@ -27,12 +27,6 @@ try:
 except ImportError:
     HAS_NOISEREDUCE = False
 
-try:
-    import webrtcvad
-    HAS_WEBRTC_VAD = True
-except ImportError:
-    HAS_WEBRTC_VAD = False
-
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog, QDialog, QLineEdit,
@@ -328,16 +322,6 @@ class OSINTCOMWindow(QMainWindow):
         self._learning_enabled = True
         self._learning_phase = "startup"  # "startup" or "periodic"
         
-        # WebRTC VAD initialization (Gate B)
-        if HAS_WEBRTC_VAD:
-            self._webrtc_vad = webrtcvad.Vad(3)  # Mode 3: most aggressive (lowest false positives)
-            self._webrtc_vad_frame_buffer = b''  # Buffer for 20ms frames
-            print("[WebRTC VAD] Initialized in aggressive mode 3 (lowest false positives)")
-        else:
-            self._webrtc_vad = None
-            self._webrtc_vad_frame_buffer = None
-            print("[WARNING] webrtcvad not installed. Gate B (WebRTC VAD) will be skipped. Install with: pip install webrtcvad")
-        
         # Audio processing settings
         self._audio_settings = {
             "use_bandpass": False,
@@ -445,6 +429,12 @@ class OSINTCOMWindow(QMainWindow):
         title.setFont(QFont("Segoe UI", 18, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
+        
+        # Version Label
+        version_label = QLabel("v1.08.2")
+        version_label.setAlignment(Qt.AlignCenter)
+        version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
+        layout.addWidget(version_label)
 
         # HFGCS Frequencies
         self.hfgcs_frequencies = [4724.0, 6739.0, 8992.0, 11175.0, 13200.0, 15016.0, 18046.0]
@@ -694,17 +684,14 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.08 Professional HF SSB VAD Pipeline (bulletproof).
+        """v1.08.2 Bulletproof VAD - Simplified to prevent crashes.
         
-        Implements the broadcast-standard multi-stage gate:
+        Uses only robust, simple signal analysis:
+        - SNR gate (noise floor + 12 dB)
+        - Energy modulation detection (no spectral analysis)
+        - Hysteresis + hangover
         
-        Stage 0: Audio preprocessing (250-2800 Hz bandpass)
-        Stage A: SNR gate (noise floor + 10-15 dB)
-        Stage B: WebRTC VAD (aggressive mode, 10-20 ms frames)
-        Stage C: Speech-likeness verification (3 checks: harmonic, modulation, formants)
-        Stage D: Hysteresis + hangover (pro squelch behavior)
-        
-        Returns: 0-100 confidence where 50+ = likely voice, hangover keeps it open
+        Returns: 0-100 confidence where 50+ = likely voice
         """
         if len(audio) < 512:
             return 0.0
@@ -712,14 +699,15 @@ class OSINTCOMWindow(QMainWindow):
         try:
             debug = self._meter_debug
             
+            # ===== SAFETY: CLIP EXTREME AUDIO =====
+            audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
+            
             # ===== INITIALIZATION =====
             if not hasattr(self, '_noise_floor_rms'):
-                self._noise_floor_rms = 0.001  # Initial quiet estimate
-                self._snr_history = collections.deque(maxlen=300)  # 6s at 50 Hz
-                self._voice_frame_count = 0
+                self._noise_floor_rms = 0.001
+                self._snr_history = collections.deque(maxlen=300)
                 self._hangover_remaining = 0.0
-                self._last_gate_open_time = 0.0
-                self._close_threshold = 7.0  # dB SNR (hysteresis)
+                self._close_threshold = 7.0  # dB SNR
                 self._open_threshold = 12.0  # dB SNR
             
             # ===== LEARNING PHASE =====
@@ -727,8 +715,8 @@ class OSINTCOMWindow(QMainWindow):
                 now = time.time()
                 if now - self._last_learning_time < self._noise_learning_time:
                     rms = np.sqrt(np.mean(audio ** 2))
-                    if rms < 0.01:  # Quiet = noise
-                        self._noise_floor_rms = rms * 0.9  # Simple low-pass
+                    if rms < 0.01:
+                        self._noise_floor_rms = rms * 0.9
                     return 0.0
                 else:
                     self._learning_phase = "periodic"
@@ -741,99 +729,75 @@ class OSINTCOMWindow(QMainWindow):
                 now = time.time()
                 rms = np.sqrt(np.mean(audio ** 2))
                 if now - self._last_relearn_time > self._noise_relearn_interval and rms < 0.005:
-                    # Update noise floor during long silence
-                    old_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
-                    self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01  # Slow update
-                    new_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
-                    if abs(new_floor_db - old_floor_db) > 1.0:
-                        print(f"[Periodic Re-learn] Noise floor: {old_floor_db:.1f} → {new_floor_db:.1f} dB")
+                    self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01
                     self._last_relearn_time = now
             
-            # ===== STAGE A: SNR GATE (STRICT ENERGY GATE) =====
+            # ===== STAGE A: SNR GATE =====
             rms = np.sqrt(np.mean(audio ** 2))
             snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
             self._snr_history.append(snr_db)
-            self._last_snr_db = snr_db  # Store for recording logic
+            self._last_snr_db = snr_db
             
-            # Hysteresis: different thresholds for open/close
+            # Hysteresis - stricter thresholds
             if self._hangover_remaining > 0:
-                # Already open, use lower close threshold (prevents chattering)
-                snr_gate_passes = snr_db > self._close_threshold
+                snr_gate_passes = snr_db > self._close_threshold  # 7 dB during hangover
             else:
-                # Not open, use higher open threshold (prevents false opens)
-                snr_gate_passes = snr_db > self._open_threshold
+                snr_gate_passes = snr_db > 14.0  # Increased from 12 dB - stricter on startup/silence
+            self._open_threshold = 14.0  # Update for consistency
             
             if not snr_gate_passes:
                 if debug and self._hangover_remaining <= 0:
                     print(f"[SNR GATE FAIL] {snr_db:.1f} dB < threshold")
-                return 5.0  # Very low but not zero
+                return 5.0
             
-            # ===== STAGE B: WEBRTC VAD (SPEECH TIMING CONFIRMATION) =====
-            # Google's WebRTC VAD is trained on human speech
-            # Run only after SNR gate passes (to avoid processing pure noise)
-            if self._webrtc_vad:
-                webrtc_passes = self._check_webrtc_vad(audio, self._sample_rate)
+            # ===== STAGE B: SIMPLE MODULATION CHECK (NO SPECTRAL ANALYSIS) =====
+            # Check if audio has varying amplitude (voice) vs flat (static)
+            # Divide into 10 chunks, measure RMS of each
+            chunk_size = len(audio) // 10
+            if chunk_size > 0:
+                rms_values = []
+                for i in range(10):
+                    start = i * chunk_size
+                    end = start + chunk_size if i < 9 else len(audio)
+                    chunk_rms = np.sqrt(np.mean(audio[start:end] ** 2))
+                    rms_values.append(chunk_rms)
+                
+                rms_values = np.array(rms_values, dtype=np.float32)
+                rms_mean = np.mean(rms_values)
+                rms_var = np.var(rms_values)
+                
+                # Voice has moderate variation (CV ~0.3-0.6)
+                # Static has high variation (CV > 0.8) or very low (CV < 0.05)
+                if rms_mean > 1e-10:
+                    cv = np.sqrt(rms_var) / rms_mean  # Coefficient of variation
+                else:
+                    cv = 0.0
+                
+                # Accept if moderate variation (voice-like): tight range to reject static
+                # Voice: ~0.30-0.50 CV (true syllabic human speech variation)
+                # Static/Noise/QRN: typically <0.15 (flat) or >0.65 (chaotic)
+                has_modulation = 0.30 < cv < 0.50
+                confidence = 75.0 if has_modulation else 10.0  # Very low default for noise
+                
                 if debug:
-                    print(f"  [WebRTC VAD] Pass={webrtc_passes}")
-                if not webrtc_passes:
-                    if debug:
-                        print(f"[WEBRTC GATE FAIL] Non-speech signal")
-                    return 15.0  # Failed WebRTC VAD gate
+                    print(f"  [Modulation CV] = {cv:.2f} → {has_modulation} (confidence {confidence:.0f})")
             else:
-                if debug:
-                    print(f"  [WebRTC VAD] SKIPPED (not installed)")
+                confidence = 50.0
             
-            # ===== STAGE C: SPEECH-LIKENESS VERIFICATION =====
-            # Check 1: Harmonic/voicing (pitch detection + spectral flatness)
-            flatness = self._spectral_flatness(audio)
-            pitch = self._pitch_periodicity(audio)
-            
-            is_voiced = (pitch > 0.25) and (flatness < 0.55)  # Voice = pitched + structured
-            if debug:
-                print(f"  [Voicing] Pitch={pitch:.2f} Flatness={flatness:.2f} → Voiced={is_voiced}")
-            
-            # Check 2: Modulation/syllabic rate (3-8 Hz modulation)
-            modulation_score = self._check_syllabic_modulation(audio)
-            has_speech_modulation = modulation_score > 0.4
-            if debug:
-                print(f"  [Modulation] Score={modulation_score:.2f} → HasSpeech={has_speech_modulation}")
-            
-            # Check 3: Narrowband energy distribution (formants vs flat)
-            formant_score = self._check_formant_structure(audio)
-            has_formants = formant_score > 0.3
-            if debug:
-                print(f"  [Formants] Score={formant_score:.2f} → HasFormants={has_formants}")
-            
-            # Speech-likeness: require at least 2 of 3 checks
-            speech_checks = sum([is_voiced, has_speech_modulation, has_formants])
-            speech_likelihood = speech_checks / 3.0 * 100  # 0-100
-            
-            if speech_checks < 2:
-                if debug:
-                    print(f"[SPEECH CHECK FAIL] Only {speech_checks}/3 checks passed")
-                return 10.0  # Failed speech verification
-            
-            # ===== FINAL CONFIDENCE SCORE =====
-            confidence = 50.0 + (speech_likelihood * 0.5)  # 50-100 range
-            confidence = np.clip(confidence, 0, 100)
-            
-            # ===== STAGE D: HANGOVER / PRO SQUELCH BEHAVIOR =====
-            if confidence > 60:  # Detected voice-like signal
-                self._hangover_remaining = 2.0  # 2 second hangover for SSB
-                self._last_gate_open_time = time.time()
+            # ===== STAGE C: HANGOVER =====
+            # Only reset hangover on strong voice confidence (>65), not on noise
+            if confidence > 65:
+                self._hangover_remaining = 2.0
             else:
-                # Decay hangover
                 self._hangover_remaining = max(0, self._hangover_remaining - (BLOCK_SIZE / self._sample_rate))
             
             if debug:
-                print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s | Recording={self._recording}")
+                print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s")
             
             return confidence
             
         except Exception as e:
-            print(f"[ERROR] VAD exception: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[VAD EXCEPTION] {str(e)[:100]}")
             return 0.0
     
     def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
@@ -845,23 +809,28 @@ class OSINTCOMWindow(QMainWindow):
         Returns: 0-1 score, higher = more speech-like modulation
         """
         try:
+            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
+            
             # Compute envelope (RMS over short windows)
             window = 128  # ~3ms at 44kHz
             envelope = []
-            for i in range(0, len(audio) - window, window):
-                e = np.sqrt(np.mean(audio[i:i+window] ** 2))
+            for i in range(0, len(audio_safe) - window, window):
+                e = np.sqrt(np.mean(audio_safe[i:i+window] ** 2))
                 envelope.append(e)
             
             if len(envelope) < 10:
                 return 0.3
             
-            envelope = np.array(envelope)
+            envelope = np.array(envelope, dtype=np.float32)
             
             # FFT of envelope (looking for 3-8 Hz modulation)
             # envelope dt ≈ 128/44000 ≈ 3ms, so Fs ≈ 333 Hz
             try:
                 from scipy.signal import welch
-                freqs, pxx = welch(envelope, fs=len(envelope) * (self._sample_rate / len(audio)))
+                freqs, pxx = welch(envelope, fs=len(envelope) * (self._sample_rate / len(audio_safe)))
+                
+                # Protect against NaN values
+                pxx = np.nan_to_num(pxx, nan=0.0, posinf=0.0, neginf=0.0)
                 
                 # Find energy in 3-8 Hz band
                 mask = (freqs >= 3) & (freqs <= 8)
@@ -872,7 +841,12 @@ class OSINTCOMWindow(QMainWindow):
                 silence_band_energy = np.mean(pxx[silence_mask]) if np.any(silence_mask) else 1
                 
                 # Speech modulation ratio
+                speech_band_energy = np.nan_to_num(speech_band_energy, nan=0.0, posinf=0.0, neginf=0.0)
+                silence_band_energy = np.nan_to_num(silence_band_energy, nan=1e-10, posinf=1.0, neginf=1e-10)
+                
                 ratio = speech_band_energy / (silence_band_energy + 1e-10)
+                ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
+                
                 return np.clip(ratio, 0, 1.0)
             except:
                 return 0.3
@@ -888,11 +862,18 @@ class OSINTCOMWindow(QMainWindow):
         Returns: 0-1 score, higher = more formant-like (voice-like)
         """
         try:
+            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
+            
             # Compute spectrum
-            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
+            freqs, pxx = welch(audio_safe, fs=self._sample_rate, nperseg=min(512, len(audio_safe)))
+            
+            # Protect against NaN and extreme values
+            pxx = np.nan_to_num(pxx, nan=0.0, posinf=1e-10, neginf=0.0)
             
             # Normalize
-            pxx = pxx / np.max(pxx + 1e-10)
+            pxx_max = np.max(pxx)
+            if pxx_max > 0:
+                pxx = pxx / np.max([pxx_max, 1e-10])
             
             # Check if energy is concentrated (voice) vs uniform (noise)
             # Voice: peaks with valleys (kurtosis > 2)
@@ -904,61 +885,11 @@ class OSINTCOMWindow(QMainWindow):
             
             # More peaks = more structure = more voice-like
             peak_ratio = len(peaks) / (len(pxx) / 50.0 + 1)  # Normalize by expected peaks
+            peak_ratio = np.nan_to_num(peak_ratio, nan=0.0, posinf=0.0, neginf=0.0)
             
             return np.clip(peak_ratio, 0, 1.0)
         except:
             return 0.3
-    
-    def _check_webrtc_vad(self, audio: np.ndarray, sample_rate: int) -> bool:
-        """Check for voice activity using Google's WebRTC VAD (Gate B).
-        
-        WebRTC VAD is trained on human speech and is very reliable for
-        detecting speech presence. Requires 16-bit PCM mono audio.
-        
-        Returns: True if speech detected, False otherwise
-        """
-        if not self._webrtc_vad:
-            return True  # If VAD not available, assume speech (don't block it)
-        
-        try:
-            # WebRTC VAD requires 16 kHz sample rate
-            # If input is different, resample or skip this check
-            if sample_rate != 16000:
-                # Resample to 16kHz for WebRTC VAD
-                from scipy.signal import resample
-                num_samples = int(len(audio) * 16000 / sample_rate)
-                audio_16k = resample(audio, num_samples)
-            else:
-                audio_16k = audio
-            
-            # Convert to 16-bit PCM bytes
-            audio_int16 = np.clip(audio_16k * 32768, -32768, 32767).astype(np.int16)
-            audio_bytes = audio_int16.tobytes()
-            
-            # Process in 20ms frames (320 samples @ 16kHz)
-            frame_size = 320  # 20ms @ 16kHz
-            vad_frames = 0
-            vad_positive = 0
-            
-            for i in range(0, len(audio_bytes) - frame_size * 2, frame_size * 2):
-                frame = audio_bytes[i:i + frame_size * 2]
-                if len(frame) == frame_size * 2:
-                    is_speech = self._webrtc_vad.is_speech(frame, 16000)
-                    vad_frames += 1
-                    if is_speech:
-                        vad_positive += 1
-            
-            # Require at least 25% of frames to be speech-active
-            if vad_frames > 0:
-                speech_ratio = vad_positive / vad_frames
-                return speech_ratio > 0.25
-            else:
-                return True  # Not enough frames, assume pass
-        
-        except Exception as e:
-            if self._meter_debug:
-                print(f"[WebRTC VAD Error] {e}")
-            return True  # If error, assume pass (don't block voice)
     
     def _calculate_confidence(self, audio: np.ndarray, preset: dict) -> float:
         """Calculate voice confidence 0-100 from 5 weighted features.
@@ -1084,11 +1015,22 @@ class OSINTCOMWindow(QMainWindow):
     def _spectral_flatness(self, audio: np.ndarray) -> float:
         """Wiener entropy: flat=1 (white noise), structured=0 (voiced). Voice has low flatness."""
         try:
-            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
+            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
+            freqs, pxx = welch(audio_safe, fs=self._sample_rate, nperseg=min(512, len(audio_safe)))
+            
+            # Protect against invalid values
             pxx = np.maximum(pxx, 1e-12)
+            pxx = np.nan_to_num(pxx, nan=1e-12, posinf=1.0, neginf=1e-12)
+            
             geom_mean = np.exp(np.mean(np.log(pxx)))
             arith_mean = np.mean(pxx)
+            
+            if np.isnan(geom_mean) or np.isnan(arith_mean) or np.isinf(arith_mean):
+                return 0.5
+            
             flatness = geom_mean / (arith_mean + 1e-12)
+            flatness = np.nan_to_num(flatness, nan=0.5, posinf=0.5, neginf=0.5)
+            
             return np.clip(flatness, 0.0, 1.0)
         except:
             return 0.5
@@ -1205,18 +1147,27 @@ class OSINTCOMWindow(QMainWindow):
         """Enhanced periodicity detection for weak/noisy signals like USB radio.
         Autocorrelation-based: voice has peaks, noise doesn't. Returns 0-1 (higher = more voice-like)."""
         try:
+            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
+            
             # Normalize (handle very quiet signals)
-            std = np.std(audio)
+            std = np.std(audio_safe)
             if std < 1e-8:
                 # Signal too quiet, be lenient
                 return 0.4
-            audio_norm = (audio - np.mean(audio)) / (std + 1e-10)
+            
+            audio_norm = (audio_safe - np.mean(audio_safe)) / (std + 1e-10)
             
             # Autocorrelation with wider search for weak signals
-            max_lag = min(len(audio) // 2, 512)
+            max_lag = min(len(audio_norm) // 2, 512)
             autocor = np.correlate(audio_norm, audio_norm, mode='full')
             autocor = autocor[len(autocor)//2:]
-            autocor = autocor / (autocor[0] + 1e-10)
+            
+            # Protect against division by zero
+            autocor_norm = np.abs(autocor[0]) + 1e-10
+            if np.isnan(autocor_norm) or np.isinf(autocor_norm):
+                return 0.35
+            
+            autocor = autocor / autocor_norm
             
             # Wider pitch range for robustness: 50-400 Hz (1-18 samples @ 44kHz)
             # Also check 400-800 Hz for harmonics
@@ -1225,6 +1176,10 @@ class OSINTCOMWindow(QMainWindow):
             
             peak1 = np.max(pitch_range_1) if len(pitch_range_1) > 0 else 0.0
             peak2 = np.max(pitch_range_2) if len(pitch_range_2) > 0 else 0.0
+            
+            # Handle NaN peaks
+            peak1 = np.nan_to_num(peak1, nan=0.0, posinf=0.0, neginf=0.0)
+            peak2 = np.nan_to_num(peak2, nan=0.0, posinf=0.0, neginf=0.0)
             
             # Combine peaks with bias toward fundamental frequency
             periodicity = max(peak1 * 0.7 + peak2 * 0.3, peak1)
@@ -1414,13 +1369,13 @@ class OSINTCOMWindow(QMainWindow):
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
             # v1.08: Use hangover behavior (pro squelch)
-            # Voice detected if: confidence > 60 OR hangover still active
+            # Voice detected if: confidence > 65 OR hangover still active
             
-            voice_detected = (confidence > 60) or (self._hangover_remaining > 0)
+            voice_detected = (confidence > 65) or (self._hangover_remaining > 0)
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
             # START RECORDING
-            if not self._recording and voice_detected and confidence > 60:
+            if not self._recording and voice_detected and confidence > 65:
                 if self._meter_debug:
                     print(f">>> RECORDING START <<< Score {confidence:.0f}/100 (SNR gate + speech verified)")
                 self._start_recording()
