@@ -822,13 +822,13 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.10c Silero VAD-first with automatic heuristic fallback.
+        """v1.10c SILERO-FIRST: ML-based speech detection as PRIMARY gate.
         
-        Primary: Silero ML-based speech detection (0.4+ = voice)
-        Secondary: SNR gate (only rejects impossibly noisy)
-        Tertiary: Modulation check (natural speech patterns)
+        Primary: Silero VAD (0.4+ = voice, most accurate for SSB)
+        Fallback: SNR+Modulation (if Silero unavailable)
+        Validator: SNR (reject impossibly noisy)
+        Confirmation: Modulation (natural speech patterns)
         
-        Falls back to heuristic if Silero unavailable.
         Returns: 0-100 confidence where 50+ = voice
         """
         if len(audio) < 512:
@@ -870,65 +870,17 @@ class OSINTCOMWindow(QMainWindow):
                     self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01
                     self._last_relearn_time = now
             
-            # ===== STAGE A: SNR GATE (PRIMARY GATEKEEPER) =====
-            # SNR is back as primary (Silero + PyTorch broke in exe, reverting to working heuristic)
-            rms = np.sqrt(np.mean(audio ** 2))
-            snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
-            self._snr_history.append(snr_db)
-            self._last_snr_db = snr_db
+            # ===== PRIMARY DETECTION STRATEGY =====
+            # If Silero VAD is ready: use it as PRIMARY gate
+            # Otherwise: fall back to proven SNR+modulation
             
-            # Use rolling percentile for SSB fading tolerance
-            if len(self._snr_history) > 10:
-                snr_percentile = np.percentile(list(self._snr_history), 20)
-            else:
-                snr_percentile = snr_db
+            use_silero = self._silero_ready and self._silero_model is not None
             
-            # LENIENT SNR threshold (Silero will boost confidence if available)
-            if self._recording:
-                snr_passes = snr_percentile > 0.0  # Ultra-lenient when recording
-            elif self._hangover_remaining > 0:
-                snr_passes = snr_percentile > 2.0  # Close threshold
-            else:
-                snr_passes = snr_percentile > 6.0  # Open threshold (lowered from 8 for SSB)
-            
-            if not snr_passes:
-                if debug and self._hangover_remaining <= 0 and not self._recording:
-                    print(f"[SNR GATE FAIL] {snr_percentile:.1f}dB < threshold {6.0:.1f}dB")
-                return 5.0
-            
-            # ===== STAGE B: MODULATION CHECK =====
-            # Energy variation detection (voice has natural modulation, static is flat/chaotic)
-            chunk_size = len(audio) // 10
-            if chunk_size > 0:
-                rms_values = []
-                for i in range(10):
-                    start = i * chunk_size
-                    end = start + chunk_size if i < 9 else len(audio)
-                    chunk_rms = np.sqrt(np.mean(audio[start:end] ** 2))
-                    rms_values.append(chunk_rms)
-                
-                rms_values = np.array(rms_values, dtype=np.float32)
-                rms_mean = np.mean(rms_values)
-                rms_var = np.var(rms_values)
-                
-                if rms_mean > 1e-10:
-                    cv = np.sqrt(rms_var) / rms_mean
-                else:
-                    cv = 0.0
-                
-                has_modulation = self._adaptive_cv_min < cv < self._adaptive_cv_max
-                confidence = 75.0 if has_modulation else 25.0
-                
-                if debug:
-                    print(f"  [Modulation] CV={cv:.2f} ({self._adaptive_cv_min:.2f}-{self._adaptive_cv_max:.2f}) → {has_modulation} (confidence {confidence:.0f})")
-            else:
-                confidence = 50.0
-            
-            # ===== STAGE C: SILERO BOOST (Optional ML enhancement) =====
-            # If Silero VAD is available, use it to boost confidence for actual speech
-            if self._silero_ready and self._silero_model is not None:
+            if use_silero:
+                # ===== SILERO FIRST: ML-based speech detection =====
+                confidence = 0.0
                 try:
-                    # Resample to 16kHz if needed
+                    # Resample to 16kHz
                     if self._sample_rate != 16000:
                         resample_factor = self._sample_rate / 16000
                         indices = np.arange(len(audio)) / resample_factor
@@ -936,30 +888,114 @@ class OSINTCOMWindow(QMainWindow):
                     else:
                         audio_resampled = audio
                     
+                    # Run Silero VAD
                     audio_tensor = torch.from_numpy(audio_resampled).float()
                     silero_prob = self._silero_model(audio_tensor, 16000).item()
                     
+                    # Convert to confidence (0-100)
                     if silero_prob >= self._silero_use_threshold:
-                        # Silero confirms speech - boost confidence
-                        confidence = min(100.0, confidence + 20.0)
-                        if debug:
-                            print(f"  [Silero BOOST] Speech prob={silero_prob:.2f} → confidence boosted to {confidence:.0f}")
+                        confidence = 60.0 + (silero_prob * 40.0)  # 60-100 for voice
                     else:
-                        # Silero says not speech - reduce confidence
-                        confidence = max(20.0, confidence - 10.0)
+                        confidence = silero_prob * 50.0  # 0-50 for non-speech
+                    
+                    # SNR validation: penalize if impossibly noisy
+                    rms = np.sqrt(np.mean(audio ** 2))
+                    snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
+                    self._snr_history.append(snr_db)
+                    self._last_snr_db = snr_db
+                    
+                    if len(self._snr_history) > 10:
+                        snr_percentile = np.percentile(list(self._snr_history), 20)
+                    else:
+                        snr_percentile = snr_db
+                    
+                    # Only penalize if SNR is catastrophically bad
+                    if snr_percentile < -3.0:
+                        confidence = max(10.0, confidence - 30.0)
                         if debug:
-                            print(f"  [Silero REDUCE] Speech prob={silero_prob:.2f} → confidence reduced to {confidence:.0f}")
+                            print(f"[Silero] SNR penalty: {snr_percentile:.1f}dB < -3dB threshold")
+                    
+                    # Modulation check: boost if natural, reduce if chaotic
+                    chunk_size = len(audio) // 10
+                    if chunk_size > 0:
+                        rms_values = []
+                        for i in range(10):
+                            start = i * chunk_size
+                            end = start + chunk_size if i < 9 else len(audio)
+                            chunk_rms = np.sqrt(np.mean(audio[start:end] ** 2))
+                            rms_values.append(chunk_rms)
+                        
+                        rms_values = np.array(rms_values, dtype=np.float32)
+                        rms_mean = np.mean(rms_values)
+                        if rms_mean > 1e-10:
+                            cv = np.sqrt(np.var(rms_values)) / rms_mean
+                        else:
+                            cv = 0.0
+                        
+                        if self._adaptive_cv_min < cv < self._adaptive_cv_max:
+                            confidence = min(100.0, confidence + 5.0)
+                            if debug:
+                                print(f"[Silero] CV={cv:.2f} natural → +5 boost (total {confidence:.0f})")
+                        else:
+                            confidence = max(10.0, confidence - 5.0)
+                            if debug:
+                                print(f"[Silero] CV={cv:.2f} unnatural → -5 penalty (total {confidence:.0f})")
+                    
+                    if debug:
+                        print(f"[Detection] Silero={silero_prob:.2f} + SNR={snr_percentile:.1f}dB → Confidence={confidence:.0f}/100")
+                        
                 except Exception as e:
                     if debug:
-                        print(f"  [Silero ERROR] {str(e)[:60]} - using heuristic confidence {confidence:.0f}")
-                    pass  # Fallback to heuristic confidence
+                        print(f"[Silero FAILED] {str(e)[:60]} - falling back to heuristic")
+                    use_silero = False  # Fall back to heuristic
             
-            # ===== STAGE D: HANGOVER =====
-            # Reset hangover on good voice confidence (>60)
-            if confidence > 60:
-                self._hangover_remaining = max(self._hangover_remaining, 2.0)
-            else:
-                self._hangover_remaining = max(0, self._hangover_remaining - (BLOCK_SIZE / self._sample_rate))
+            if not use_silero:
+                # ===== FALLBACK: SNR + Modulation (proven working) =====
+                rms = np.sqrt(np.mean(audio ** 2))
+                snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
+                self._snr_history.append(snr_db)
+                self._last_snr_db = snr_db
+                
+                if len(self._snr_history) > 10:
+                    snr_percentile = np.percentile(list(self._snr_history), 20)
+                else:
+                    snr_percentile = snr_db
+                
+                # SNR gate
+                if self._recording:
+                    snr_passes = snr_percentile > 0.0
+                elif self._hangover_remaining > 0:
+                    snr_passes = snr_percentile > 2.0
+                else:
+                    snr_passes = snr_percentile > 6.0
+                
+                if not snr_passes:
+                    return 5.0
+                
+                # Modulation check
+                chunk_size = len(audio) // 10
+                if chunk_size > 0:
+                    rms_values = []
+                    for i in range(10):
+                        start = i * chunk_size
+                        end = start + chunk_size if i < 9 else len(audio)
+                        chunk_rms = np.sqrt(np.mean(audio[start:end] ** 2))
+                        rms_values.append(chunk_rms)
+                    
+                    rms_values = np.array(rms_values, dtype=np.float32)
+                    rms_mean = np.mean(rms_values)
+                    if rms_mean > 1e-10:
+                        cv = np.sqrt(np.var(rms_values)) / rms_mean
+                    else:
+                        cv = 0.0
+                    
+                    has_modulation = self._adaptive_cv_min < cv < self._adaptive_cv_max
+                    confidence = 75.0 if has_modulation else 25.0
+                    
+                    if debug:
+                        print(f"[Detection] Fallback: SNR={snr_percentile:.1f}dB + CV={cv:.2f} → Confidence={confidence:.0f}/100")
+                else:
+                    confidence = 50.0
             
             if debug:
                 print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s")
