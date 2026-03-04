@@ -322,6 +322,14 @@ class OSINTCOMWindow(QMainWindow):
         self._learning_enabled = True
         self._learning_phase = "startup"  # "startup" or "periodic"
         
+        # Noise calibration
+        self._calibration_active = False
+        self._calibration_samples = []
+        self._calibration_start = None
+        self._adaptive_snr_threshold = 13.0  # Default, updated by calibration
+        self._adaptive_cv_min = 0.28  # Default, updated by calibration
+        self._adaptive_cv_max = 0.55  # Default, updated by calibration
+        
         # Audio processing settings
         self._audio_settings = {
             "use_bandpass": False,
@@ -526,11 +534,14 @@ class OSINTCOMWindow(QMainWindow):
         self.audio_settings_btn.clicked.connect(self._open_audio_settings)
         self.save_btn = QPushButton("Save Settings")
         self.save_btn.clicked.connect(self._save_config)
+        self.calibrate_btn = QPushButton("Calibrate Noise")
+        self.calibrate_btn.clicked.connect(self._on_calibrate_noise)
         controls_layout.addWidget(self.start_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.file_btn)
         controls_layout.addWidget(self.audio_settings_btn)
         controls_layout.addWidget(self.save_btn)
+        controls_layout.addWidget(self.calibrate_btn)
         layout.addWidget(controls_group)
 
         # Status Bar
@@ -642,6 +653,100 @@ class OSINTCOMWindow(QMainWindow):
         self._meter_timer.stop()
         self._stop_audio_stream()
 
+    def _on_calibrate_noise(self):
+        """Record 10 seconds of ambient noise, analyze it, and auto-adjust VAD thresholds."""
+        msg = QMessageBox()
+        msg.setWindowTitle("Calibrate Noise Floor")
+        msg.setText("Recording 10 seconds of ambient noise...\n\nMake sure the radio is NOT transmitting voice.")
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.setIcon(QMessageBox.Information)
+        
+        # Show dialog but don't block
+        self.calibrate_btn.setEnabled(False)
+        self._calibration_samples = []
+        self._calibration_start = time.time()
+        self._calibration_active = True
+        self.status_bar.showMessage("🎤 CALIBRATING... Do not speak (10s)")
+        
+        # After 10 seconds, analyze and adjust
+        QTimer.singleShot(10000, self._analyze_calibration)
+
+    def _analyze_calibration(self):
+        """Analyze recorded noise and adjust VAD thresholds."""
+        self._calibration_active = False
+        
+        if len(self._calibration_samples) < 100:
+            self.status_bar.showMessage("Calibration failed: insufficient audio samples")
+            self.calibrate_btn.setEnabled(True)
+            return
+        
+        try:
+            # Concatenate all samples
+            audio_data = np.concatenate(self._calibration_samples)
+            audio_data = np.clip(audio_data, -1.0, 1.0).astype(np.float32)
+            
+            # Analyze noise properties
+            rms_noise = np.sqrt(np.mean(audio_data ** 2))
+            snr_db_noise = 20 * np.log10((rms_noise + 1e-10) / (self._noise_floor_rms + 1e-10))
+            
+            # Check modulation (CV) of noise
+            chunk_size = len(audio_data) // 10
+            rms_values = []
+            for i in range(10):
+                start = i * chunk_size
+                end = start + chunk_size if i < 9 else len(audio_data)
+                chunk_rms = np.sqrt(np.mean(audio_data[start:end] ** 2))
+                rms_values.append(chunk_rms)
+            
+            rms_mean = np.mean(rms_values)
+            if rms_mean > 1e-10:
+                cv_noise = np.std(rms_values) / rms_mean
+            else:
+                cv_noise = 0.0
+            
+            # Adjust thresholds based on noise characteristics
+            # If noise is high energy, raise SNR gate
+            # If noise has high modulation (variable), tighten CV range
+            
+            old_snr = self._open_threshold
+            old_cv_min = 0.28
+            old_cv_max = 0.55
+            
+            # Adaptive SNR: noise SNR was X, so require human voice to be at least +4dB above that
+            new_snr = max(13.0, snr_db_noise + 4.0)  # At least 13 dB floor
+            
+            # Adaptive CV: if noise CV is high (variable), tighten CV acceptance
+            if cv_noise > 0.45:
+                new_cv_min = 0.32  # Tighten range
+                new_cv_max = 0.50
+            else:
+                new_cv_min = 0.28
+                new_cv_max = 0.55
+            
+            # Log the changes
+            msg = f"📊 Calibration Complete:\n\n"
+            msg += f"Noise SNR: {snr_db_noise:.1f} dB\n"
+            msg += f"Noise CV: {cv_noise:.2f}\n\n"
+            msg += f"Adjusted thresholds:\n"
+            msg += f"SNR: {old_snr:.1f} → {new_snr:.1f} dB\n"
+            msg += f"CV: {old_cv_min:.2f}-{old_cv_max:.2f} → {new_cv_min:.2f}-{new_cv_max:.2f}"
+            
+            # Store new thresholds in VAD
+            self._adaptive_snr_threshold = new_snr
+            self._adaptive_cv_min = new_cv_min
+            self._adaptive_cv_max = new_cv_max
+            
+            self.status_bar.showMessage(f"✓ Calibrated: SNR={new_snr:.1f}dB, CV={new_cv_min:.2f}-{new_cv_max:.2f}")
+            
+            QMessageBox.information(self, "Calibration Complete", msg)
+            
+        except Exception as e:
+            self.status_bar.showMessage(f"Calibration error: {str(e)[:50]}")
+            QMessageBox.warning(self, "Calibration Error", f"Failed to analyze noise: {str(e)[:100]}")
+        finally:
+            self.calibrate_btn.setEnabled(True)
+            self._calibration_samples = []
+
     def _start_audio_stream(self):
         try:
             device_data = self.device_combo.currentData()
@@ -677,6 +782,10 @@ class OSINTCOMWindow(QMainWindow):
         
         with self._lock:
             self._ring_buffer.append(audio_chunk)
+        
+        # Capture calibration samples if calibration active
+        if self._calibration_active:
+            self._calibration_samples.append(audio_chunk)
         
         # Buffer recording chunk outside main lock
         if self._recording:
@@ -739,15 +848,16 @@ class OSINTCOMWindow(QMainWindow):
             self._last_snr_db = snr_db
             
             # Hysteresis - balanced thresholds (rejects static but catches voice)
+            # Use adaptive thresholds if calibrated, otherwise use defaults
             if self._hangover_remaining > 0:
                 snr_gate_passes = snr_db > self._close_threshold  # 7 dB during hangover
             else:
-                snr_gate_passes = snr_db > 13.0  # Balanced - allows faint voice but rejects silence
-            self._open_threshold = 13.0  # Update for consistency
+                snr_gate_passes = snr_db > self._adaptive_snr_threshold  # Use adaptive threshold
+            self._open_threshold = self._adaptive_snr_threshold
             
             if not snr_gate_passes:
                 if debug and self._hangover_remaining <= 0:
-                    print(f"[SNR GATE FAIL] {snr_db:.1f} dB < threshold")
+                    print(f"[SNR GATE FAIL] {snr_db:.1f} dB < threshold {self._adaptive_snr_threshold:.1f}dB")
                 return 5.0
             
             # ===== STAGE B: SIMPLE MODULATION CHECK (NO SPECTRAL ANALYSIS) =====
@@ -773,14 +883,14 @@ class OSINTCOMWindow(QMainWindow):
                 else:
                     cv = 0.0
                 
-                # Accept if moderate variation (voice-like): balanced range
+                # Accept if moderate variation (voice-like): use adaptive range
                 # Voice: ~0.28-0.55 CV (human speech plus variations)
                 # Static/Noise/QRN: typically <0.15 (flat) or >0.65 (chaotic)
-                has_modulation = 0.28 < cv < 0.55
+                has_modulation = self._adaptive_cv_min < cv < self._adaptive_cv_max
                 confidence = 70.0 if has_modulation else 20.0  # Moderate default for marginal signals
                 
                 if debug:
-                    print(f"  [Modulation CV] = {cv:.2f} → {has_modulation} (confidence {confidence:.0f})")
+                    print(f"  [Modulation CV] = {cv:.2f} (range {self._adaptive_cv_min:.2f}-{self._adaptive_cv_max:.2f}) → {has_modulation} (confidence {confidence:.0f})")
             else:
                 confidence = 50.0
             
