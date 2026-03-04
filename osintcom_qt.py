@@ -632,7 +632,8 @@ class OSINTCOMWindow(QMainWindow):
         dlg = WebhookDialog(self._webhook_url, self)
         if dlg.exec_() == QDialog.Accepted:
             self._webhook_url = dlg.get_url()
-            self.webhook_edit.setText(self._webhook_url[:50] + "..." if len(self._webhook_url) > 50 else self._webhook_url)
+            self.webhook_edit.setText("✓ Webhook configured (" + self._webhook_url[-20:] + ")")
+            self.webhook_edit.setReadOnly(True)
             self._save_config()  # Auto-save webhook
 
     def _open_customize_dialog(self):
@@ -866,41 +867,66 @@ class OSINTCOMWindow(QMainWindow):
                     self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01
                     self._last_relearn_time = now
             
-            # ===== STAGE A: SNR GATE =====
+            # ===== STAGE A: SILERO VAD (PRIMARY - ML-based speech detection) =====
+            # Silero VAD is our PRIMARY detector for SSB voice
+            silero_confidence = 0.0
+            if self._silero_ready and self._silero_model is not None:
+                try:
+                    # Resample to 16kHz if needed
+                    if self._sample_rate != 16000:
+                        resample_factor = self._sample_rate / 16000
+                        indices = np.arange(len(audio)) / resample_factor
+                        audio_resampled = np.interp(indices, np.arange(len(audio)), audio)
+                    else:
+                        audio_resampled = audio
+                    
+                    audio_tensor = torch.from_numpy(audio_resampled).float()
+                    silero_prob = self._silero_model(audio_tensor, 16000).item()
+                    silero_confidence = silero_prob * 100.0  # Convert to 0-100 scale
+                    
+                    if debug:
+                        print(f"[Silero VAD] Speech probability: {silero_prob:.2f} ({silero_confidence:.0f}/100)")
+                except Exception as e:
+                    if debug:
+                        print(f"[Silero Error] {str(e)[:60]} - falling back to heuristic")
+                    silero_confidence = 50.0  # Neutral fallback
+            else:
+                # No Silero available - use SNR as baseline
+                silero_confidence = 50.0
+            
+            # ===== STAGE B: SNR VALIDATION =====
+            # SNR acts as a secondary check - if too noisy, reduce confidence
             rms = np.sqrt(np.mean(audio ** 2))
             snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
             self._snr_history.append(snr_db)
             self._last_snr_db = snr_db
             
-            # For SSB: use rolling minimum SNR (20th percentile) to catch fading signals
-            # This prevents momentary dips from causing false negatives on SSB
+            # Use rolling percentile SNR for SSB fading tolerance
             if len(self._snr_history) > 10:
-                snr_percentile = np.percentile(list(self._snr_history), 20)  # 20th percentile = more lenient than instantaneous
+                snr_percentile = np.percentile(list(self._snr_history), 20)
             else:
                 snr_percentile = snr_db
             
-            # Hysteresis - balanced thresholds
-            # For SSB reception: use lenient thresholds to catch fading signals
+            # SNR check: penalize if REALLY noisy (not rewarded for being quiet)
             if self._recording:
-                # When already recording: use close threshold (more lenient, 5 dB) to sustain through fades
-                snr_gate_passes = snr_percentile > (self._close_threshold - 2.0)  # 5 dB close threshold
+                min_snr_threshold = 3.0  # Very lenient when recording (5 - 2)
             elif self._hangover_remaining > 0:
-                # During hangover: use close threshold
-                snr_gate_passes = snr_percentile > self._close_threshold  # 5 dB during hangover
+                min_snr_threshold = 5.0  # Close threshold
             else:
-                # Not recording: use open threshold (slightly lower than adaptive for SSB)
-                snr_gate_passes = snr_percentile > max(9.0, self._adaptive_snr_threshold - 2.0)  # More lenient by 2dB for SSB
+                min_snr_threshold = 9.0  # Open threshold (11 - 2)
             
-            self._open_threshold = self._adaptive_snr_threshold
+            # If SNR is too low, reduce confidence proportionally
+            if snr_percentile < (min_snr_threshold - 3.0):
+                snr_penalty = max(0, 30 * ((min_snr_threshold - 3.0) - snr_percentile) / 10)  # Steep penalty below
+                silero_confidence = max(10.0, silero_confidence - snr_penalty)
+                if debug:
+                    print(f"  [SNR Penalty] {snr_percentile:.1f}dB < {min_snr_threshold - 3:.1f}dB → penalty {snr_penalty:.0f}")
+            else:
+                if debug:
+                    print(f"  [SNR OK] Percentile {snr_percentile:.1f}dB >= threshold {min_snr_threshold:.1f}dB")
             
-            if not snr_gate_passes:
-                if debug and self._hangover_remaining <= 0 and not self._recording:
-                    print(f"[SNR GATE FAIL] Inst={snr_db:.1f}dB Percentile={snr_percentile:.1f}dB < threshold {max(9.0, self._adaptive_snr_threshold - 2.0):.1f}dB")
-                return 5.0
-            
-            # ===== STAGE B: SIMPLE MODULATION CHECK (NO SPECTRAL ANALYSIS) =====
-            # Check if audio has varying amplitude (voice) vs flat (static)
-            # Divide into 10 chunks, measure RMS of each
+            # ===== STAGE C: MODULATION CHECK (speech naturalness) =====
+            # Check if audio has natural speech-like modulation
             chunk_size = len(audio) // 10
             if chunk_size > 0:
                 rms_values = []
@@ -914,67 +940,34 @@ class OSINTCOMWindow(QMainWindow):
                 rms_mean = np.mean(rms_values)
                 rms_var = np.var(rms_values)
                 
-                # Voice has moderate variation (CV ~0.3-0.6)
-                # Static has high variation (CV > 0.8) or very low (CV < 0.05)
                 if rms_mean > 1e-10:
-                    cv = np.sqrt(rms_var) / rms_mean  # Coefficient of variation
+                    cv = np.sqrt(rms_var) / rms_mean
                 else:
                     cv = 0.0
                 
-                # Accept if moderate variation (voice-like): use adaptive range
-                # Voice: ~0.28-0.60 CV (human speech plus variations - wider to catch more)
-                # Static/Noise/QRN: typically <0.15 (flat) or >0.70 (chaotic)
+                # If modulation looks like speech, boost confidence
                 has_modulation = self._adaptive_cv_min < cv < self._adaptive_cv_max
-                confidence = 75.0 if has_modulation else 25.0  # Wider range, but duration timer filters false positives
-                
-                if debug:
-                    print(f"  [Modulation CV] = {cv:.2f} (range {self._adaptive_cv_min:.2f}-{self._adaptive_cv_max:.2f}) → {has_modulation} (confidence {confidence:.0f})")
-            else:
-                confidence = 50.0
+                if has_modulation:
+                    silero_confidence = min(100.0, silero_confidence + 10.0)  # +10% if natural modulation
+                    if debug:
+                        print(f"  [Modulation OK] CV={cv:.2f} in range {self._adaptive_cv_min:.2f}-{self._adaptive_cv_max:.2f} → +10 boost")
+                else:
+                    silero_confidence = max(10.0, silero_confidence - 15.0)  # -15% if no modulation
+                    if debug:
+                        print(f"  [Modulation FAIL] CV={cv:.2f} outside range → -15 penalty")
             
-            # ===== STAGE C: HANGOVER =====
-            # Reset hangover on good voice confidence (>62), extends for post_roll duration
+            # Use Silero confidence as final score
+            confidence = silero_confidence
+            
+            # ===== STAGE D: HANGOVER =====
+            # Reset hangover on good voice confidence (>62)
             if confidence > 62:
-                self._hangover_remaining = max(self._hangover_remaining, 2.0)  # Minimum 2s, can be extended by post_roll
+                self._hangover_remaining = max(self._hangover_remaining, 2.0)
             else:
                 self._hangover_remaining = max(0, self._hangover_remaining - (BLOCK_SIZE / self._sample_rate))
             
             if debug:
                 print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s")
-            
-            # ===== STAGE B-PLUS: SILERO VAD (ML-based speech confirmation) =====
-            # If SNR passes and Silero is available, verify it's actually speech
-            if self._silero_ready and self._silero_model is not None:
-                try:
-                    # Silero expects audio at 16kHz, so resample if needed
-                    if self._sample_rate != 16000:
-                        # Simple nearest-neighbor downsampling for 44.1kHz -> 16kHz
-                        resample_factor = self._sample_rate / 16000
-                        indices = np.arange(len(audio)) / resample_factor
-                        audio_resampled = np.interp(indices, np.arange(len(audio)), audio)
-                    else:
-                        audio_resampled = audio
-                    
-                    # Convert to torch tensor and run Silero VAD
-                    audio_tensor = torch.from_numpy(audio_resampled).float()
-                    silero_prob = self._silero_model(audio_tensor, 16000).item()
-                    
-                    # Silero returns probability 0-1, use threshold
-                    if silero_prob >= self._silero_confidence_threshold:
-                        # Silero confirms speech - boost confidence
-                        sileo_boost = 15.0  # Boost existing confidence by this much
-                        confidence = min(100.0, confidence + sileo_boost)
-                        if debug:
-                            print(f"  [Silero VAD] Speech prob={silero_prob:.2f} → SPEECH DETECTED (confidence boosted)")
-                    else:
-                        # Silero says not speech - reduce confidence significantly
-                        confidence = max(25.0, confidence * 0.5)
-                        if debug:
-                            print(f"  [Silero VAD] Speech prob={silero_prob:.2f} → NOT SPEECH (confidence reduced)")
-                except Exception as e:
-                    if debug:
-                        print(f"  [Silero ERROR] {str(e)[:80]} - falling back to heuristic")
-                    pass  # Fall back to heuristic if Silero fails
             
             return confidence
             
@@ -1758,9 +1751,11 @@ class OSINTCOMWindow(QMainWindow):
                 
                 if "frequency" in config:
                     self.freq_display.setText(config["frequency"])
+                    self._frequency = config["frequency"].split()[0]  # Extract just the number
                 
                 if "webhook_url" in config:
-                    self.webhook_edit.setText(config["webhook_url"])
+                    self.webhook_edit.setText("✓ Webhook configured (" + config["webhook_url"][-20:] + ")")
+                    self.webhook_edit.setReadOnly(True)
                     self._webhook_url = config["webhook_url"]
                 
                 if "custom_message" in config:
