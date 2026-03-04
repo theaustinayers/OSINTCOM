@@ -738,12 +738,12 @@ class OSINTCOMWindow(QMainWindow):
             self._snr_history.append(snr_db)
             self._last_snr_db = snr_db
             
-            # Hysteresis - very strict thresholds to reject static
+            # Hysteresis - balanced thresholds (rejects static but catches voice)
             if self._hangover_remaining > 0:
                 snr_gate_passes = snr_db > self._close_threshold  # 7 dB during hangover
             else:
-                snr_gate_passes = snr_db > 16.0  # Increased from 14 dB - very strict on startup
-            self._open_threshold = 16.0  # Update for consistency
+                snr_gate_passes = snr_db > 13.0  # Balanced - allows faint voice but rejects silence
+            self._open_threshold = 13.0  # Update for consistency
             
             if not snr_gate_passes:
                 if debug and self._hangover_remaining <= 0:
@@ -773,11 +773,11 @@ class OSINTCOMWindow(QMainWindow):
                 else:
                     cv = 0.0
                 
-                # Accept if moderate variation (voice-like): very tight range to reject static/QRN
-                # Voice: ~0.35-0.45 CV (true syllabic human speech variation only)
-                # Static/Noise/QRN: typically <0.20 (flat) or >0.60 (chaotic)
-                has_modulation = 0.35 < cv < 0.45
-                confidence = 65.0 if has_modulation else 8.0  # Very low default for noise
+                # Accept if moderate variation (voice-like): balanced range
+                # Voice: ~0.28-0.55 CV (human speech plus variations)
+                # Static/Noise/QRN: typically <0.15 (flat) or >0.65 (chaotic)
+                has_modulation = 0.28 < cv < 0.55
+                confidence = 70.0 if has_modulation else 20.0  # Moderate default for marginal signals
                 
                 if debug:
                     print(f"  [Modulation CV] = {cv:.2f} → {has_modulation} (confidence {confidence:.0f})")
@@ -785,8 +785,8 @@ class OSINTCOMWindow(QMainWindow):
                 confidence = 50.0
             
             # ===== STAGE C: HANGOVER =====
-            # Only reset hangover on very strong voice confidence (>70), not on marginal noise
-            if confidence > 70:
+            # Reset hangover on good voice confidence (>62), rejects noise
+            if confidence > 62:
                 self._hangover_remaining = 2.0
             else:
                 self._hangover_remaining = max(0, self._hangover_remaining - (BLOCK_SIZE / self._sample_rate))
@@ -1369,13 +1369,13 @@ class OSINTCOMWindow(QMainWindow):
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
             # v1.08: Use hangover behavior (pro squelch)
-            # Voice detected if: confidence > 70 OR hangover still active
+            # Voice detected if: confidence > 62 OR hangover still active
             
-            voice_detected = (confidence > 70) or (self._hangover_remaining > 0)
+            voice_detected = (confidence > 62) or (self._hangover_remaining > 0)
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
             # START RECORDING
-            if not self._recording and voice_detected and confidence > 70:
+            if not self._recording and voice_detected and confidence > 62:
                 if self._meter_debug:
                     print(f">>> RECORDING START <<< Score {confidence:.0f}/100 (SNR gate + speech verified)")
                 self._start_recording()
