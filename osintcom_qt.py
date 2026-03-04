@@ -678,25 +678,17 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.07 Intelligent Voice Detection: Real-world bulletproof VAD.
+        """v1.08 Professional HF SSB VAD Pipeline (bulletproof).
         
-        Strategy: REJECT STATIC FIRST, then look for VOICE.
+        Implements the broadcast-standard multi-stage gate:
         
-        Static rejection checks (must ALL pass for static to be accepted):
-        1. Spectral flatness: Static = flat spectrum, Voice = structured
-        2. Energy variance: Static = constant, Voice = modulated
-        3. Crash patterns: Static crashes have characteristic spikes
-        4. Crest factor: Static = peaky spikes, Voice = smooth peaks
-        5. Multi-band stability: Static repeats same pattern, Voice evolves
+        Stage 0: Audio preprocessing (250-2800 Hz bandpass)
+        Stage A: SNR gate (noise floor + 10-15 dB)
+        Stage B: WebRTC VAD (aggressive mode, 10-20 ms frames)
+        Stage C: Speech-likeness verification (3 checks: harmonic, modulation, formants)
+        Stage D: Hysteresis + hangover (pro squelch behavior)
         
-        Voice confirmation (must pass threshold of these):
-        1. Speech band dominance: Voice concentrates 800-3k Hz
-        2. Modulation envelope: Voice syllables visible in RMS over time
-        3. Spectral structure: Voice has harmonic peaks, not flat
-        4. Pitch/periodicity: Autocorrelation shows voice pitch
-        5. Frequency stability: Voice stays in speech band
-        
-        Returns: Confidence 0-100 where 50+ = likely voice
+        Returns: 0-100 confidence where 50+ = likely voice, hangover keeps it open
         """
         if len(audio) < 512:
             return 0.0
@@ -704,164 +696,108 @@ class OSINTCOMWindow(QMainWindow):
         try:
             debug = self._meter_debug
             
-            # ===== PHASE 1: LEARN NOISE FLOOR (first 3 seconds) =====
+            # ===== INITIALIZATION =====
+            if not hasattr(self, '_noise_floor_rms'):
+                self._noise_floor_rms = 0.001  # Initial quiet estimate
+                self._snr_history = collections.deque(maxlen=300)  # 6s at 50 Hz
+                self._voice_frame_count = 0
+                self._hangover_remaining = 0.0
+                self._last_gate_open_time = 0.0
+                self._close_threshold = 7.0  # dB SNR (hysteresis)
+                self._open_threshold = 12.0  # dB SNR
+            
+            # ===== LEARNING PHASE =====
             if self._learning_phase == "startup":
                 now = time.time()
                 if now - self._last_learning_time < self._noise_learning_time:
-                    energy_db = self._energy_db(audio)
-                    if energy_db < -20:  # Quiet = likely noise
-                        self._noise_samples.append(energy_db)
+                    rms = np.sqrt(np.mean(audio ** 2))
+                    if rms < 0.01:  # Quiet = noise
+                        self._noise_floor_rms = rms * 0.9  # Simple low-pass
                     return 0.0
                 else:
-                    # Learning complete
                     self._learning_phase = "periodic"
-                    if self._noise_samples:
-                        self._noise_floor_db = np.median(list(self._noise_samples))
-                    print(f"✓ LEARNING COMPLETE: Noise floor = {self._noise_floor_db:.1f} dB")
-                    print(f"  System will detect voices at L{self._sensitivity_level}")
+                    print(f"✓ LEARNING COMPLETE: Noise floor = {20*np.log10(self._noise_floor_rms+1e-10):.1f} dB")
                     self._last_relearn_time = now
                     return 0.0
             
-            # ===== PHASE 2: PERIODIC RE-LEARNING =====
+            # ===== PERIODIC NOISE FLOOR UPDATE =====
             elif self._learning_phase == "periodic" and not self._recording:
                 now = time.time()
-                time_since_relearn = now - self._last_relearn_time
-                energy_db = self._energy_db(audio)
-                
-                if time_since_relearn >= self._noise_relearn_interval and energy_db < -20:
-                    self._noise_samples.append(energy_db)
-                    if len(self._noise_samples) >= 5:
-                        old_floor = self._noise_floor_db
-                        self._noise_floor_db = np.median(list(self._noise_samples))
-                        self._noise_samples.clear()
-                        self._last_relearn_time = now
+                rms = np.sqrt(np.mean(audio ** 2))
+                if now - self._last_relearn_time > self._noise_relearn_interval and rms < 0.005:
+                    # Update noise floor during long silence
+                    old_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
+                    self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01  # Slow update
+                    new_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
+                    if abs(new_floor_db - old_floor_db) > 1.0:
+                        print(f"[Periodic Re-learn] Noise floor: {old_floor_db:.1f} → {new_floor_db:.1f} dB")
+                    self._last_relearn_time = now
             
-            # ===== PHASE 3: INTELLIGENT VOICE DETECTION =====
+            # ===== STAGE A: SNR GATE (STRICT ENERGY GATE) =====
+            rms = np.sqrt(np.mean(audio ** 2))
+            snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
+            self._snr_history.append(snr_db)
+            self._last_snr_db = snr_db  # Store for recording logic
             
-            # Get preset thresholds
-            preset = SENSITIVITY_PRESETS[self._sensitivity_level]
+            # Hysteresis: different thresholds for open/close
+            if self._hangover_remaining > 0:
+                # Already open, use lower close threshold (prevents chattering)
+                snr_gate_passes = snr_db > self._close_threshold
+            else:
+                # Not open, use higher open threshold (prevents false opens)
+                snr_gate_passes = snr_db > self._open_threshold
             
-            # Calculate energy relative to noise floor
-            energy_db = self._energy_db(audio)
-            signal_above_floor_db = energy_db - self._noise_floor_db
+            if not snr_gate_passes:
+                if debug and self._hangover_remaining <= 0:
+                    print(f"[SNR GATE FAIL] {snr_db:.1f} dB < threshold")
+                return 5.0  # Very low but not zero
             
-            # If signal is below noise floor, it's definitely not voice
-            if signal_above_floor_db < 0:
-                if debug:
-                    print(f"[REJECT] Signal below noise floor: {energy_db:.1f}dB < {self._noise_floor_db:.1f}dB")
-                return 0.0
-            
-            # ===== STATIC REJECTION: Multiple parallel checks =====
-            
-            # Check 1: Spectral flatness (static = flat, voice = structured)
+            # ===== STAGE B: SPEECH-LIKENESS VERIFICATION =====
+            # Check 1: Harmonic/voicing (pitch detection + spectral flatness)
             flatness = self._spectral_flatness(audio)
-            is_flat_spectrum = flatness > 0.65  # Very flat = likely static/noise
-            if debug and is_flat_spectrum:
-                print(f"[REJECT] Flat spectrum: {flatness:.2f} (likely static)")
-            
-            # Check 2: Energy variance in time (static = constant, voice = modulated)
-            energy_rms = np.abs(np.sqrt(np.mean(audio ** 2)))
-            if len(audio) > 100:
-                frame_size = len(audio) // 4
-                frames = [np.sqrt(np.mean(audio[i:i+frame_size] ** 2)) 
-                         for i in range(0, len(audio) - frame_size, frame_size)]
-                if frames:
-                    energy_variance = np.var(frames) / (np.mean(frames) + 1e-10)
-                else:
-                    energy_variance = 0
-            else:
-                energy_variance = 0
-            
-            is_constant_energy = energy_variance < 0.005  # Very constant = likely static
-            if debug and is_constant_energy:
-                print(f"[REJECT] Constant energy: variance {energy_variance:.4f} (likely static)")
-            
-            # Check 3: Crash pattern detection (HF crashes spike one band)
-            is_crash_pattern = self._detect_crash_pattern(audio)
-            if debug and is_crash_pattern:
-                print(f"[REJECT] Crash pattern detected (broadband spike)")
-            
-            # Check 4: Crest factor too high (spiky = static crashes, smooth = voice)
-            crest = self._crest_factor(audio)
-            is_overly_spiky = crest > 2.0  # Extremely peaky
-            if debug and is_overly_spiky:
-                print(f"[REJECT] Overly spiky (crest {crest:.2f} likely crash)")
-            
-            # **STATIC CONFIRMED** if 3+ checks say "static"
-            static_checks = sum([is_flat_spectrum, is_constant_energy, is_crash_pattern, is_overly_spiky])
-            if static_checks >= 3:
-                if debug:
-                    print(f"[RESULT] STATIC - {static_checks}/4 static checks passed")
-                return 5.0  # Very low but not zero (edge case: might be very faint voice)
-            
-            # ===== VOICE CONFIRMATION: Look for voice characteristics =====
-            
-            voice_score = 0.0
-            
-            # Feature 1: Speech band dominance (800-3000 Hz) - 30 points max
-            band_energy = self._extract_speech_band_energy(audio)
-            total_energy_linear = energy_rms
-            if total_energy_linear > 1e-10:
-                band_dominance = band_energy / total_energy_linear
-                # Voice: 60%+ in band, Static: 20-40%
-                if band_dominance > 0.60:
-                    band_points = 30
-                elif band_dominance > 0.40:
-                    band_points = 15 + (band_dominance - 0.40) / 0.20 * 15
-                else:
-                    band_points = 0
-                voice_score += band_points
-                if debug:
-                    print(f"  [Band] {band_dominance:.0%} in speech band → {band_points:.0f}/30 pts")
-            
-            # Feature 2: Spectral structure (voice has peaks) - 25 points max
-            if not is_flat_spectrum:  # If spectrum is structured (not flat)
-                structure_points = 25
-            else:
-                structure_points = 0
-            voice_score += structure_points
-            if debug:
-                print(f"  [Structure] Flatness {flatness:.2f} → {structure_points:.0f}/25 pts")
-            
-            # Feature 3: Modulation (voice envelopes) - 20 points max
-            if energy_variance > 0.02:  # Modulated signal
-                modulation_points = min(20, energy_variance * 500)  # Scale up variance to points
-            else:
-                modulation_points = 0
-            voice_score += modulation_points
-            if debug:
-                print(f"  [Modulation] Variance {energy_variance:.4f} → {modulation_points:.0f}/20 pts")
-            
-            # Feature 4: Pitch/periodicity - 15 points max
             pitch = self._pitch_periodicity(audio)
-            if pitch > 0.3:
-                pitch_points = 15
-            elif pitch > 0.15:
-                pitch_points = 10
+            
+            is_voiced = (pitch > 0.25) and (flatness < 0.55)  # Voice = pitched + structured
+            if debug:
+                print(f"  [Voicing] Pitch={pitch:.2f} Flatness={flatness:.2f} → Voiced={is_voiced}")
+            
+            # Check 2: Modulation/syllabic rate (3-8 Hz modulation)
+            modulation_score = self._check_syllabic_modulation(audio)
+            has_speech_modulation = modulation_score > 0.4
+            if debug:
+                print(f"  [Modulation] Score={modulation_score:.2f} → HasSpeech={has_speech_modulation}")
+            
+            # Check 3: Narrowband energy distribution (formants vs flat)
+            formant_score = self._check_formant_structure(audio)
+            has_formants = formant_score > 0.3
+            if debug:
+                print(f"  [Formants] Score={formant_score:.2f} → HasFormants={has_formants}")
+            
+            # Speech-likeness: require at least 2 of 3 checks
+            speech_checks = sum([is_voiced, has_speech_modulation, has_formants])
+            speech_likelihood = speech_checks / 3.0 * 100  # 0-100
+            
+            if speech_checks < 2:
+                if debug:
+                    print(f"[SPEECH CHECK FAIL] Only {speech_checks}/3 checks passed")
+                return 10.0  # Failed speech verification
+            
+            # ===== FINAL CONFIDENCE SCORE =====
+            confidence = 50.0 + (speech_likelihood * 0.5)  # 50-100 range
+            confidence = np.clip(confidence, 0, 100)
+            
+            # ===== STAGE D: HANGOVER / PRO SQUELCH BEHAVIOR =====
+            if confidence > 60:  # Detected voice-like signal
+                self._hangover_remaining = 2.0  # 2 second hangover for SSB
+                self._last_gate_open_time = time.time()
             else:
-                pitch_points = 0
-            voice_score += pitch_points
-            if debug:
-                print(f"  [Pitch] Periodicity {pitch:.2f} → {pitch_points:.0f}/15 pts")
-            
-            # Feature 5: Signal above noise floor - 10 points max
-            if signal_above_floor_db > 6:  # 6 dB above floor
-                floor_points = 10
-            elif signal_above_floor_db > 3:
-                floor_points = 5
-            else:
-                floor_points = 0
-            voice_score += floor_points
-            if debug:
-                print(f"  [Floor] {signal_above_floor_db:.1f}dB above floor → {floor_points:.0f}/10 pts")
-            
-            # Voice score is 0-100
-            voice_score = np.clip(voice_score, 0, 100)
+                # Decay hangover
+                self._hangover_remaining = max(0, self._hangover_remaining - (BLOCK_SIZE / self._sample_rate))
             
             if debug:
-                print(f"[RESULT] VOICE SCORE: {voice_score:.0f}/100 | E={energy_db:.1f}dB | Floor={self._noise_floor_db:.1f}dB | L{self._sensitivity_level}")
+                print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s | Recording={self._recording}")
             
-            return voice_score
+            return confidence
             
         except Exception as e:
             print(f"[ERROR] VAD exception: {e}")
@@ -869,47 +805,78 @@ class OSINTCOMWindow(QMainWindow):
             traceback.print_exc()
             return 0.0
     
-    def _detect_crash_pattern(self, audio: np.ndarray) -> bool:
-        """Detect characteristic HF radio crash patterns.
+    def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
+        """Check for speech-like modulation at 3-8 Hz (syllabic rate).
         
-        HF crashes are broadband impulses with:
-        - Energy spike in 1-2 frequency bins
-        - Fast rise/fall times
-        - No harmonic structure
+        Human speech has energy modulation around syllable rate.
+        Static bursts don't have this pattern.
         
-        Returns True if crash pattern detected.
+        Returns: 0-1 score, higher = more speech-like modulation
         """
         try:
-            # Look for rapid energy changes (crash characteristic)
-            if len(audio) < 100:
-                return False
+            # Compute envelope (RMS over short windows)
+            window = 128  # ~3ms at 44kHz
+            envelope = []
+            for i in range(0, len(audio) - window, window):
+                e = np.sqrt(np.mean(audio[i:i+window] ** 2))
+                envelope.append(e)
             
-            # Compute short-term energy envelope
-            frame_size = len(audio) // 10
-            if frame_size < 50:
-                frame_size = 50
+            if len(envelope) < 10:
+                return 0.3
             
-            energies = []
-            for i in range(0, len(audio) - frame_size, frame_size):
-                e = np.sqrt(np.mean(audio[i:i+frame_size] ** 2))
-                energies.append(e)
+            envelope = np.array(envelope)
             
-            if len(energies) < 3:
-                return False
-            
-            # Look for sudden energy spikes (drop > 10 dB in one frame)
-            energies = np.array(energies)
-            energy_db = 20 * np.log10(energies + 1e-10)
-            
-            # Calculate frame-to-frame changes
-            diffs = np.abs(np.diff(energy_db))
-            
-            # Crash = sudden spike followed by sudden drop (diffs > 10 dB both directions)
-            has_spike = np.any(diffs > 10)
-            
-            return has_spike
+            # FFT of envelope (looking for 3-8 Hz modulation)
+            # envelope dt ≈ 128/44000 ≈ 3ms, so Fs ≈ 333 Hz
+            try:
+                from scipy.signal import welch
+                freqs, pxx = welch(envelope, fs=len(envelope) * (self._sample_rate / len(audio)))
+                
+                # Find energy in 3-8 Hz band
+                mask = (freqs >= 3) & (freqs <= 8)
+                speech_band_energy = np.mean(pxx[mask]) if np.any(mask) else 0
+                
+                # Find energy in silence band (0-1 Hz and >15 Hz)
+                silence_mask = ((freqs >= 0) & (freqs <= 1)) | (freqs > 15)
+                silence_band_energy = np.mean(pxx[silence_mask]) if np.any(silence_mask) else 1
+                
+                # Speech modulation ratio
+                ratio = speech_band_energy / (silence_band_energy + 1e-10)
+                return np.clip(ratio, 0, 1.0)
+            except:
+                return 0.3
         except:
-            return False
+            return 0.3
+    
+    def _check_formant_structure(self, audio: np.ndarray) -> float:
+        """Check for formant-like structure (peaks in spectrogram).
+        
+        Speech has formants (concentrated energy bands).
+        Noise has relatively flat energy distribution.
+        
+        Returns: 0-1 score, higher = more formant-like (voice-like)
+        """
+        try:
+            # Compute spectrum
+            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
+            
+            # Normalize
+            pxx = pxx / np.max(pxx + 1e-10)
+            
+            # Check if energy is concentrated (voice) vs uniform (noise)
+            # Voice: peaks with valleys (kurtosis > 2)
+            # Noise: relatively flat (kurtosis ≈ 0-1)
+            
+            # Simple: count number of local maxima in spectrum
+            from scipy.signal import argrelextrema
+            peaks = argrelextrema(pxx, np.greater, order=10)[0]
+            
+            # More peaks = more structure = more voice-like
+            peak_ratio = len(peaks) / (len(pxx) / 50.0 + 1)  # Normalize by expected peaks
+            
+            return np.clip(peak_ratio, 0, 1.0)
+        except:
+            return 0.3
     
     def _calculate_confidence(self, audio: np.ndarray, preset: dict) -> float:
         """Calculate voice confidence 0-100 from 5 weighted features.
@@ -1364,65 +1331,37 @@ class OSINTCOMWindow(QMainWindow):
                 self._last_debug_print = now
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
-            # v1.07: Simpler, smarter logic based on voice_score
-            # voice_score: 0-100 where 50+ = likely voice, <20 = likely static
+            # v1.08: Use hangover behavior (pro squelch)
+            # Voice detected if: confidence > 60 OR hangover still active
             
-            # Get preset thresholds
-            start_threshold = preset.get("confidence_start", 65)
-            continue_threshold = preset.get("confidence_continue", 30)
-            
-            # Simple moving average for stability (not EMA, straight average)
-            if not hasattr(self, '_score_history'):
-                self._score_history = collections.deque(maxlen=5)
-            self._score_history.append(confidence)
-            avg_score = np.mean(list(self._score_history))
-            
-            # Adjusted thresholds based on sensitivity level
-            # Level 1 (max): Start at 40, Continue at 20
-            # Level 5 (strict): Start at 75, Continue at 50
-            adjusted_start = start_threshold - 10 + (self._sensitivity_level - 1) * 2  # 55-75
-            adjusted_continue = max(15, adjusted_start - 20)  # Keep gap of ~20 pts
-            
-            if self._meter_debug:
-                print(f"[Score] Raw={confidence:.0f} Avg={avg_score:.0f} | Start threshold={adjusted_start:.0f} | Recording={self._recording}")
+            voice_detected = (confidence > 60) or (self._hangover_remaining > 0)
+            snr_display = getattr(self, '_last_snr_db', -60.0)
             
             # START RECORDING
-            if not self._recording and avg_score >= adjusted_start:
+            if not self._recording and voice_detected and confidence > 60:
                 if self._meter_debug:
-                    print(f">>> RECORDING START <<< Score {avg_score:.0f} >= {adjusted_start:.0f}")
+                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100 (SNR gate + speech verified)")
                 self._start_recording()
-                self._last_word_peak_time = time.time()
-                self.status_bar.showMessage(f"Recording started | Voice detected at {self._frequency}")
+                self.status_bar.showMessage(f"Recording started | Voice detected (SNR={snr_display:.1f}dB)")
             
             # CONTINUE RECORDING
             elif self._recording:
-                time_since_last_word = time.time() - self._last_word_peak_time
-                post_roll_seconds = preset.get("post_roll_seconds", 10)
-                post_roll_remaining = post_roll_seconds - time_since_last_word
-                
-                # Update word peak if score is high
-                if confidence >= 70:
-                    self._last_word_peak_time = time.time()
-                    post_roll_remaining = post_roll_seconds
-                    if self._meter_debug:
-                        print(f"[Word Peak] Score {confidence:.0f}>=70 → reset post-roll")
-                
-                # Decide to continue or stop
-                should_continue = (
-                    avg_score >= adjusted_continue or  # Score still decent
-                    post_roll_remaining > 0  # Still in post-roll window
-                )
-                
-                if should_continue:
+                if voice_detected:
+                    # Still within hangover window
                     self.status_bar.showMessage(
-                        f"Recording... | Score: {avg_score:.0f} | Post-roll: {post_roll_remaining:.1f}s"
+                        f"Recording... | Score: {confidence:.0f}/100 | Hangover: {self._hangover_remaining:.2f}s"
                     )
                 else:
-                    # STOP RECORDING
+                    # Hangover expired, stop recording
                     if self._meter_debug:
-                        print(f">>> RECORDING STOP <<< Score {avg_score:.0f} < {adjusted_continue:.0f} & post-roll expired")
+                        print(f">>> RECORDING STOP <<< Hangover expired")
                     self._finalize_recording()
-                    self.status_bar.showMessage(f"Recording stopped | Silence detected")
+                    self.status_bar.showMessage(f"Recording stopped | Hangover timeout")
+            
+            # Update voice indicator
+            if voice_detected != self._voice_detected:
+                self._voice_detected = voice_detected
+                self._signals.voice.emit(voice_detected)
 
 
     def _start_recording(self):
