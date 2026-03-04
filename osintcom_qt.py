@@ -43,37 +43,44 @@ CONFIG_FILE = "osintcom_config.json"
 CHANNELS = 1
 BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0
-VOICE_SILENCE_TAIL = 3.0  # Reduced from 10s to stop recording faster
+POST_ROLL_SECONDS = 10.0  # 10 seconds after last word peak
 MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
-VAD_SMOOTHING_WINDOW = 4  # Reduced from 10 to 4 for faster silence detection
-VAD_ENERGY_DROP_THRESHOLD = 5.0  # dB drop that indicates end of voice
+VAD_SMOOTHING_WINDOW = 3  # Confidence smoothing window
+VAD_WORD_PEAK_THRESHOLD = 75  # Confidence needed to consider it a word
+VAD_START_CONFIDENCE = 65  # Start recording threshold
+VAD_CONTINUE_CONFIDENCE = 30  # Continue recording threshold
+VAD_STOP_CONFIDENCE = 20  # Stop recording threshold
 
-# Hybrid VAD: EAM Watcher algorithms + Adaptive Noise Floor Learning
-# Learns actual noise floor during first 3 seconds, then sets thresholds intelligently
-# Voice detection: Energy + Spectral Features for low SNR discrimination
+# Confidence-Based Professional VAD (v1.06)
+# Scores voice 0-100 based on: energy, band dominance, spectral entropy, ZCR, pitch
+# Detects word peaks and uses 10-second post-roll from last word
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches faintest voices just above noise floor
-    # db_above_noise_floor: how far above learned noise to trigger
-    1: {"db_above_noise": 2.0, "autocorr": 0.05, "flatness": 0.70,
-        "prominence": 6.0, "envelope_var": 0.0, "harmonicity": 0.0,
-        "crest_factor": 0.0, "smoothing_req": 5, "hold_req": 2},
-    # Level 2: Very sensitive - adds slight spectral filtering
-    2: {"db_above_noise": 3.0, "autocorr": 0.08, "flatness": 0.65,
-        "prominence": 7.0, "envelope_var": 0.0, "harmonicity": 0.0,
-        "crest_factor": 0.2, "smoothing_req": 5, "hold_req": 2},
-    # Level 3: Balanced (default) - some noise rejection
-    3: {"db_above_noise": 4.0, "autocorr": 0.10, "flatness": 0.60,
-        "prominence": 8.0, "envelope_var": 0.001, "harmonicity": 0.0,
-        "crest_factor": 0.5, "smoothing_req": 6, "hold_req": 2},
-    # Level 4: Strict - better noise rejection
-    4: {"db_above_noise": 5.0, "autocorr": 0.15, "flatness": 0.50,
-        "prominence": 9.0, "envelope_var": 0.002, "harmonicity": 0.5,
-        "crest_factor": 0.8, "smoothing_req": 7, "hold_req": 3},
-    # Level 5: Voice only - maximum static rejection
-    5: {"db_above_noise": 6.0, "autocorr": 0.20, "flatness": 0.40,
-        "prominence": 10.0, "envelope_var": 0.004, "harmonicity": 1.0,
-        "crest_factor": 1.2, "smoothing_req": 8, "hold_req": 3},
+    # Level 1: Maximum sensitivity - catches faintest voices
+    1: {"confidence_start": 55, "confidence_continue": 20, "confidence_stop": 10,
+        "word_peak_threshold": 65, "post_roll_seconds": 10,
+        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
+        "zcr_weight": 0.15, "pitch_weight": 0.10},
+    # Level 2: Very sensitive - good for weak radio
+    2: {"confidence_start": 60, "confidence_continue": 25, "confidence_stop": 15,
+        "word_peak_threshold": 70, "post_roll_seconds": 10,
+        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
+        "zcr_weight": 0.15, "pitch_weight": 0.10},
+    # Level 3: Balanced (default)
+    3: {"confidence_start": 65, "confidence_continue": 30, "confidence_stop": 20,
+        "word_peak_threshold": 75, "post_roll_seconds": 10,
+        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
+        "zcr_weight": 0.15, "pitch_weight": 0.10},
+    # Level 4: Strict - rejects static
+    4: {"confidence_start": 70, "confidence_continue": 40, "confidence_stop": 25,
+        "word_peak_threshold": 80, "post_roll_seconds": 10,
+        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
+        "zcr_weight": 0.15, "pitch_weight": 0.10},
+    # Level 5: Voice only - maximum rejection
+    5: {"confidence_start": 75, "confidence_continue": 50, "confidence_stop": 30,
+        "word_peak_threshold": 85, "post_roll_seconds": 10,
+        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
+        "zcr_weight": 0.15, "pitch_weight": 0.10},
 }
 
 SENSITIVITY_LABELS = {
@@ -666,23 +673,31 @@ class OSINTCOMWindow(QMainWindow):
             with self._audio_buffer_lock:
                 self._audio_buffer.append(audio_chunk)
 
-    def _detect_voice(self, audio: np.ndarray) -> bool:
-        """Hybrid VAD with Adaptive Noise Floor Learning.
-        Learns the actual noise floor during first 3 seconds, then detects voice intelligently."""
+    def _detect_voice(self, audio: np.ndarray) -> float:
+        """v1.06 Confidence-Based VAD: returns 0-100 confidence score of voice detection.
+        
+        Features (0-100 points total):
+        1. Energy in speech band (300-3000 Hz): 30 points
+        2. Band dominance (speech band > 60% of energy): 25 points
+        3. Spectral entropy (voice < flat noise): 20 points
+        4. Zero-crossing rate (voice variation): 15 points
+        5. Fundamental frequency/pitch: 10 points
+        
+        Adaptive learning learns actual noise floor (first 3s), re-learns every 4 minutes.
+        Returns confidence 0-100 for downstream logic to decide start/continue/stop/word-peak.
+        """
         if len(audio) < 512:
-            return False
+            return 0.0
         try:
             preset = SENSITIVITY_PRESETS[self._sensitivity_level]
-            debug = False  # Disable debug logging for production
-            
-            # Calculate energy
-            energy_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
+            debug = self._meter_debug
             
             # ===== NOISE FLOOR LEARNING (first 3 seconds) =====
             if self._learning_phase == "startup":
                 elapsed = time.time() - self._last_learning_time
                 if elapsed < self._noise_learning_time:
                     # During learning phase, collect quiet samples to estimate noise floor
+                    energy_db = self._energy_db(audio)
                     if energy_db < -20:  # Likely noise, not voice
                         self._noise_samples.append(energy_db)
                     
@@ -697,14 +712,16 @@ class OSINTCOMWindow(QMainWindow):
                     if len(self._noise_samples) > 0:
                         self._noise_floor_db = np.median(list(self._noise_samples))
                     print(f"✓ Startup learning complete: Noise floor = {self._noise_floor_db:.1f} dB")
-                    print(f"  Will trigger on signals > {self._noise_floor_db + preset['db_above_noise']:.1f} dB")
+                    print(f"  Sensitivity Level {self._sensitivity_level}: Start at {preset['confidence_start']}% confidence")
                     print(f"  Will re-learn every {self._noise_relearn_interval/60:.0f} minutes during silence")
                     self._last_relearn_time = time.time()
+                return 0.0  # Don't trigger during learning
             
             # ===== PERIODIC NOISE FLOOR RE-LEARNING (every 4 minutes) =====
             # Only re-learn during silence (not recording), to adapt to propagation changes
             elif self._learning_phase == "periodic" and not self._recording:
                 time_since_relearn = time.time() - self._last_relearn_time
+                energy_db = self._energy_db(audio)
                 
                 if time_since_relearn >= self._noise_relearn_interval:
                     # Start a new learning cycle (collect for 0.5 seconds)
@@ -717,66 +734,137 @@ class OSINTCOMWindow(QMainWindow):
                         self._noise_samples.clear()
                         self._last_relearn_time = time.time()
                         if self._noise_floor_db != old_floor:
-                            print(f"[Periodic Re-learn] Noise floor updated: {old_floor:.1f} dB → {self._noise_floor_db:.1f} dB (propagation change)")
-                            print(f"  Threshold now: {self._noise_floor_db + preset['db_above_noise']:.1f} dB")
+                            print(f"[Periodic Re-learn] Noise floor updated: {old_floor:.1f} dB → {self._noise_floor_db:.1f} dB")
                 
                 elif time_since_relearn > self._noise_relearn_interval + 5.0:
-                    # If we've been over threshold for too long without collecting samples, reset
+                    # Reset learning for next cycle
                     self._noise_samples.clear()
                     self._last_relearn_time = time.time()
-                    if debug:
-                        print(f"[Periodic Re-learn] Reset at {time_since_relearn:.0f}s for next cycle")
             
-            # ===== VOICE DETECTION AFTER LEARNING =====
-            # 1. ENERGY CHECK relative to learned noise floor
-            threshold_db = self._noise_floor_db + preset["db_above_noise"]
-            if energy_db < threshold_db:
-                if debug and self._learning_phase == "periodic":
-                    print(f"VAD FAIL: Energy {energy_db:.1f} dB < threshold {threshold_db:.1f} dB (noise floor {self._noise_floor_db:.1f} + {preset['db_above_noise']:.1f})")
-                return False
-            
-            # 2. SPECTRAL FLATNESS - reject pure noise (even if loud)
-            # Pure noise = high flatness, voice = low flatness
-            flatness = self._spectral_flatness(audio)
-            if flatness > preset["flatness"]:
-                if debug and self._learning_phase == "periodic":
-                    print(f"VAD FAIL: Flatness {flatness:.4f} > {preset['flatness']:.4f} (noise-like spectrum)")
-                return False
-            
-            # 3. AUTOCORRELATION periodicty - voice has pitch structure
-            autocorr = self._autocorrelation_periodicity(audio)
-            if autocorr < preset["autocorr"]:
-                if debug and self._learning_phase == "periodic":
-                    print(f"VAD FAIL: Autocorr {autocorr:.3f} < {preset['autocorr']:.3f} (no pitch structure)")
-                return False
-            
-            # 4. ENVELOPE VARIANCE - voice modulates, static doesn't
-            env_var = self._envelope_variance(audio)
-            if env_var < preset["envelope_var"]:
-                if debug and self._learning_phase == "periodic":
-                    print(f"VAD FAIL: Env.Var {env_var:.6f} < {preset['envelope_var']:.6f} (too steady)")
-                return False
-            
-            # 5. HARMONICITY - voice has harmonic content
-            harmonicity = self._harmonicity_score(audio)
-            if harmonicity < preset["harmonicity"]:
-                if debug and self._learning_phase == "periodic":
-                    print(f"VAD FAIL: Harmonicity {harmonicity:.2f} < {preset['harmonicity']:.2f} (inharmonic)")
-                return False
-            
-            # 6. CREST FACTOR - voice has peaks, static is flat
-            crest = self._crest_factor(audio)
-            if crest < preset["crest_factor"]:
-                if debug and self._learning_phase == "periodic":
-                    print(f"VAD FAIL: Crest {crest:.2f} < {preset['crest_factor']:.2f} (flat)")
-                return False
+            # ===== CONFIDENCE CALCULATION =====
+            confidence = self._calculate_confidence(audio, preset)
             
             if debug and self._learning_phase == "periodic":
-                print(f"✓ VOICE: E={energy_db:.1f}dB (thr={threshold_db:.1f}) F={flatness:.3f} A={autocorr:.2f} EV={env_var:.5f} H={harmonicity:.1f} C={crest:.1f}")
-            return True
+                energy_db = self._energy_db(audio)
+                print(f"Conf: {confidence:.0f}% | E={energy_db:.1f}dB (floor={self._noise_floor_db:.1f})")
+            
+            return confidence
         except Exception as e:
             print(f"VAD Exception: {e}")
-            return False
+            return 0.0
+    
+    def _calculate_confidence(self, audio: np.ndarray, preset: dict) -> float:
+        """Calculate voice confidence 0-100 from 5 weighted features.
+        
+        Features:
+        1. Energy in speech band (300-3000 Hz): 30 points
+        2. Band dominance (speech band % of total energy): 25 points
+        3. Spectral entropy (low = structured/voice, high = flat/noise): 20 points
+        4. Zero-crossing rate (voice varies, noise constant): 15 points
+        5. Pitch/periodicity (voice has pitch, noise doesn't): 10 points
+        
+        Total: 100 points
+        """
+        try:
+            confidence = 0.0
+            
+            # Feature 1: Energy in speech band (300-3000 Hz) - 30 points
+            energy_db = self._energy_db(audio)
+            threshold_db = self._noise_floor_db + preset.get("confidence_start", 65)
+            
+            # Map energy to 0-30 points: below threshold = 0, at threshold + 6dB = 30
+            db_above_threshold = energy_db - threshold_db
+            energy_points = np.clip((db_above_threshold / 6.0) * 30, 0, 30)
+            confidence += energy_points
+            
+            # Feature 2: Band dominance - 25 points
+            band_energy = self._extract_speech_band_energy(audio)
+            total_energy_linear = np.sqrt(np.mean(audio ** 2))
+            if total_energy_linear > 1e-10:
+                band_dominance = band_energy / total_energy_linear
+                # Voice: >60% in speech band, static: <30%
+                # Map: <30% = 0 pts, 60% = 25 pts, >80% = 25 pts
+                if band_dominance < 0.30:
+                    band_points = 0
+                elif band_dominance < 0.60:
+                    band_points = (band_dominance - 0.30) / 0.30 * 25
+                else:
+                    band_points = 25
+                confidence += band_points
+            
+            # Feature 3: Spectral entropy (low = voice structure) - 20 points
+            flatness = self._spectral_flatness(audio)
+            # Voice: <0.4 flatness, Noise: >0.6
+            # Map: >0.6 = 0 pts, <0.4 = 20 pts, linear between
+            if flatness > 0.60:
+                entropy_points = 0
+            elif flatness < 0.40:
+                entropy_points = 20
+            else:
+                entropy_points = (0.60 - flatness) / 0.20 * 20
+            confidence += entropy_points
+            
+            # Feature 4: Zero-crossing rate (mid-range = voice) - 15 points
+            zcr = self._zero_crossing_rate(audio)
+            # Voice: 0.1-0.5, Static: >0.5
+            # Map: <0.1 = 10 pts, 0.3 = 15 pts, >0.5 = 0 pts
+            if zcr < 0.10:
+                zcr_points = 10
+            elif zcr < 0.30:
+                zcr_points = 10 + (zcr - 0.10) / 0.20 * 5
+            elif zcr < 0.50:
+                zcr_points = 15 - (zcr - 0.30) / 0.20 * 15
+            else:
+                zcr_points = 0
+            confidence += zcr_points
+            
+            # Feature 5: Pitch/periodicity (voice = periodic) - 10 points
+            pitch = self._pitch_periodicity(audio)
+            # Voice: >0.4 periodicity, Noise: <0.2
+            # Map: <0.2 = 0 pts, >0.4 = 10 pts, linear between
+            if pitch > 0.40:
+                pitch_points = 10
+            elif pitch < 0.20:
+                pitch_points = 0
+            else:
+                pitch_points = (pitch - 0.20) / 0.20 * 10
+            confidence += pitch_points
+            
+            return np.clip(confidence, 0.0, 100.0)
+        except Exception as e:
+            print(f"Confidence calc error: {e}")
+            return 0.0
+    
+    def _extract_speech_band_energy(self, audio: np.ndarray) -> float:
+        """Extract RMS energy in speech band (300-3000 Hz)."""
+        try:
+            # Apply bandpass filter
+            sos = butter(4, [300, 3000], btype='band', fs=self._sample_rate, output='sos')
+            filtered = sosfiltfilt(sos, audio)
+            
+            # Return RMS energy
+            return np.sqrt(np.mean(filtered ** 2))
+        except:
+            return np.sqrt(np.mean(audio ** 2)) * 0.5  # Fallback: assume 50% in band
+    
+    def _energy_db(self, audio: np.ndarray, return_linear: bool = False) -> float:
+        """Calculate RMS energy in dB or linear domain.
+        
+        Args:
+            audio: Audio samples
+            return_linear: If True, return RMS (linear). If False, return dB.
+        
+        Returns:
+            Energy in dB (default) or RMS (if return_linear=True)
+        """
+        try:
+            rms = np.sqrt(np.mean(audio ** 2))
+            if return_linear:
+                return rms
+            else:
+                return 20 * np.log10(rms + 1e-10)
+        except:
+            return 0.0 if not return_linear else 1e-10
     
     def _spectral_flatness(self, audio: np.ndarray) -> float:
         """Wiener entropy: flat=1 (white noise), structured=0 (voiced). Voice has low flatness."""
@@ -1047,6 +1135,14 @@ class OSINTCOMWindow(QMainWindow):
             return audio
 
     def _update_meter(self):
+        """v1.06: Confidence-based VAD with word-level detection and 10s post-roll.
+        
+        Detection states:
+        - START: Confidence ≥ 65% (default Level 3)
+        - CONTINUE: Confidence ≥ 30% OR within 10s of last detected word
+        - WORD PEAK: Confidence ≥ 75% (detected word/syllable, resets post-roll timer)
+        - STOP: Confidence < 20% AND > 10s since last word peak
+        """
         db = self._peak_db
         self.audio_meter.set_level(db)
         self.meter_label.setText(f"{db:+.1f} dB")
@@ -1058,41 +1154,87 @@ class OSINTCOMWindow(QMainWindow):
                 current_chunk = self._ring_buffer[-1]
         
         if current_chunk is not None:
-            voice = self._detect_voice(current_chunk)
+            # Get confidence score (0-100) instead of boolean
+            confidence = self._detect_voice(current_chunk)
             
-            # Check for energy drop-off (indicates end of voice)
-            energy_drop = self._previous_energy_db - db
-            if self._recording and energy_drop > VAD_ENERGY_DROP_THRESHOLD:
-                # Sudden energy drop = likely end of voice, force silence
-                voice = False
-            self._previous_energy_db = db
+            # Get thresholds for current sensitivity level
+            preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
+            start_threshold = preset.get("confidence_start", 65)
+            continue_threshold = preset.get("confidence_continue", 30)
+            stop_threshold = preset.get("confidence_stop", 20)
+            word_peak_threshold = preset.get("word_peak_threshold", 75)
+            post_roll_seconds = preset.get("post_roll_seconds", 10)
             
-            self._voice_history.append(voice)
-            detected = sum(self._voice_history) > len(self._voice_history) / 2
+            # Smooth confidence with exponential moving average
+            # EMA = (confidence * weight) + (previous_ema * (1 - weight))
+            ema_weight = 0.25  # Faster response than binary history
+            if not hasattr(self, '_confidence_ema'):
+                self._confidence_ema = confidence
+            else:
+                self._confidence_ema = (confidence * ema_weight) + (self._confidence_ema * (1 - ema_weight))
             
+            # Track word peak (syllable detection)
+            now = time.time()
+            if not hasattr(self, '_last_word_peak_time'):
+                self._last_word_peak_time = now - post_roll_seconds  # Start fresh
+            
+            # WORD PEAK DETECTION: High confidence = detected word/syllable
+            if confidence >= word_peak_threshold:
+                self._last_word_peak_time = now
+                if self._meter_debug:
+                    print(f"[Word Peak] Confidence {confidence:.0f}% >= {word_peak_threshold}% (reset post-roll)")
+            
+            # Calculate time since last detected word
+            time_since_last_word = now - self._last_word_peak_time
+            post_roll_remaining = post_roll_seconds - time_since_last_word
+            
+            # ===== RECORDING START/CONTINUE/STOP LOGIC =====
+            
+            # START RECORDING: First time confidence exceeds start threshold
+            if not self._recording and self._confidence_ema >= start_threshold:
+                if self._meter_debug:
+                    print(f"[Recording START] Confidence {self._confidence_ema:.0f}% >= {start_threshold}% (start threshold)")
+                self._start_recording()
+                self._voice_silence_at = None
+                self._silence_timer_remaining = post_roll_seconds
+            
+            # CONTINUE RECORDING: Either:
+            # 1. Confidence still high (within speech pauses)
+            # 2. Within post-roll window from last detected word
+            elif self._recording:
+                # Decide whether to continue or stop
+                should_continue = (
+                    self._confidence_ema >= continue_threshold or  # Confidence high enough
+                    post_roll_remaining > 0  # Still in post-roll window
+                )
+                
+                if should_continue:
+                    # Update status bar with post-roll info
+                    if post_roll_remaining <= 0:
+                        # Post-roll expired
+                        self.status_bar.showMessage(
+                            f"Recording... | Conf: {self._confidence_ema:.0f}% | Silence (post-roll expired)"
+                        )
+                    else:
+                        # Still in post-roll
+                        self.status_bar.showMessage(
+                            f"Recording... | Conf: {self._confidence_ema:.0f}% | Post-roll: {post_roll_remaining:.1f}s"
+                        )
+                    self._voice_silence_at = None
+                    self._silence_timer_remaining = post_roll_seconds - time_since_last_word
+                else:
+                    # STOP RECORDING: Below threshold AND outside post-roll
+                    if self._meter_debug:
+                        print(f"[Recording STOP] Conf {self._confidence_ema:.0f}% < {stop_threshold}% & post-roll expired")
+                    self._finalize_recording()
+            
+            # Emit voice detection signal for visual indicator
+            # Voice indicator = if we're recording OR if confidence is high
+            detected = self._confidence_ema >= continue_threshold or (self._recording and post_roll_remaining > 0)
             if detected != self._voice_detected:
                 self._voice_detected = detected
                 self._signals.voice.emit(detected)
-                if detected and not self._recording:
-                    self._start_recording()
-                elif not detected and self._recording:
-                    self._voice_silence_at = time.time()
-                    self._silence_timer_remaining = VOICE_SILENCE_TAIL
-            
-            # Check for silence timeout and update countdown
-            if not detected and self._recording and self._voice_silence_at:
-                elapsed = time.time() - self._voice_silence_at
-                self._silence_timer_remaining = max(0, VOICE_SILENCE_TAIL - elapsed)
-                
-                if elapsed > VOICE_SILENCE_TAIL:
-                    self._finalize_recording()
-                else:
-                    # Update status with red countdown
-                    self.status_bar.showMessage(
-                        f"Recording... | VAD: Silence | >>> TIMEOUT IN {self._silence_timer_remaining:.1f}s <<<"
-                    )
-            elif self._recording and detected:
-                self.status_bar.showMessage(f"Recording... | VAD: Voice | Frequency: {self._frequency}")
+
 
     def _start_recording(self):
         self._recording = True
