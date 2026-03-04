@@ -129,6 +129,21 @@ The VAD uses **spectral analysis** to distinguish voice from static:
 
 ---
 
+## Technical Deep-Dive: VAD Architecture
+
+For detailed information about how the VAD detection pipeline works, see **[VAD-Architecture.md](docs/VAD-Architecture.md)**.
+
+This covers:
+- **3-gate detection system** (SNR gate + speech-likeness verification)
+- **Parameter tuning guide** for different HF conditions
+- **Squelch behavior** (attack/hangover) to prevent clipped words
+- **Recording strategy** with pre-roll and sanity checks
+- **Advanced troubleshooting** for weak stations and false positives
+
+This is the authoritative reference for v1.08+ VAD behavior.
+
+---
+
 ## Troubleshooting
 
 ### Audio Not Detected / No Devices Showing
