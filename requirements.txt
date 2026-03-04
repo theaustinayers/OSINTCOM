@@ -9,3 +9,5 @@ python-dotenv
 pycaw; platform_system == "Windows"
 # For denoising (optional, basic)
 noisereduce
+# For ML-based speech detection (pre-trained, lightweight, offline)
+silero-vad

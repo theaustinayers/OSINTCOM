@@ -27,6 +27,13 @@ try:
 except ImportError:
     HAS_NOISEREDUCE = False
 
+try:
+    import torch
+    from silero_vad import load_silero_vad
+    HAS_SILERO = True
+except ImportError:
+    HAS_SILERO = False
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog, QDialog, QLineEdit,
@@ -42,8 +49,8 @@ CONFIG_FILE = "osintcom_config.json"
 
 CHANNELS = 1
 BLOCK_SIZE = 2048
-PRE_ROLL_SECONDS = 5.0
-POST_ROLL_SECONDS = 10.0  # 10 seconds after last word peak
+PRE_ROLL_SECONDS = 3.0  # 3 seconds of audio before VAD triggers
+POST_ROLL_SECONDS = 10.0  # 10 seconds of silence/decay after last word peak
 MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
 VAD_SMOOTHING_WINDOW = 3  # Confidence smoothing window
@@ -327,8 +334,23 @@ class OSINTCOMWindow(QMainWindow):
         self._calibration_samples = []
         self._calibration_start = None
         self._adaptive_snr_threshold = 13.0  # Default, updated by calibration
-        self._adaptive_cv_min = 0.28  # Default, updated by calibration
-        self._adaptive_cv_max = 0.55  # Default, updated by calibration
+        self._adaptive_cv_min = 0.25  # Default, updated by calibration (was 0.28)
+        self._adaptive_cv_max = 0.60  # Default, updated by calibration (was 0.55)
+        
+        # Voice confirmation timer - requires 3.5 seconds of sustained high confidence
+        self._voice_confidence_duration = 0.0  # Cumulative seconds of high confidence
+        self._voice_confirmation_threshold = 3.5  # Seconds of voice confidence needed
+        self._last_high_confidence_time = None  # Timestamp of last high confidence frame
+        
+        # Silero VAD model (loaded on background thread on startup)
+        self._silero_model = None
+        self._silero_ready = False
+        self._silero_confidence_threshold = 0.5  # Speech probability threshold (0-1)
+        if HAS_SILERO:
+            # Load Silero VAD in background to avoid blocking UI
+            threading.Thread(target=self._load_silero_vad, daemon=True).start()
+        else:
+            print("[WARNING] silero-vad not installed - using heuristic VAD only")
         
         # Audio processing settings
         self._audio_settings = {
@@ -884,10 +906,10 @@ class OSINTCOMWindow(QMainWindow):
                     cv = 0.0
                 
                 # Accept if moderate variation (voice-like): use adaptive range
-                # Voice: ~0.28-0.55 CV (human speech plus variations)
-                # Static/Noise/QRN: typically <0.15 (flat) or >0.65 (chaotic)
+                # Voice: ~0.28-0.60 CV (human speech plus variations - wider to catch more)
+                # Static/Noise/QRN: typically <0.15 (flat) or >0.70 (chaotic)
                 has_modulation = self._adaptive_cv_min < cv < self._adaptive_cv_max
-                confidence = 70.0 if has_modulation else 20.0  # Moderate default for marginal signals
+                confidence = 75.0 if has_modulation else 25.0  # Wider range, but duration timer filters false positives
                 
                 if debug:
                     print(f"  [Modulation CV] = {cv:.2f} (range {self._adaptive_cv_min:.2f}-{self._adaptive_cv_max:.2f}) → {has_modulation} (confidence {confidence:.0f})")
@@ -895,20 +917,68 @@ class OSINTCOMWindow(QMainWindow):
                 confidence = 50.0
             
             # ===== STAGE C: HANGOVER =====
-            # Reset hangover on good voice confidence (>62), rejects noise
+            # Reset hangover on good voice confidence (>62), extends for post_roll duration
             if confidence > 62:
-                self._hangover_remaining = 2.0
+                self._hangover_remaining = max(self._hangover_remaining, 2.0)  # Minimum 2s, can be extended by post_roll
             else:
                 self._hangover_remaining = max(0, self._hangover_remaining - (BLOCK_SIZE / self._sample_rate))
             
             if debug:
                 print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s")
             
+            # ===== STAGE B-PLUS: SILERO VAD (ML-based speech confirmation) =====
+            # If SNR passes and Silero is available, verify it's actually speech
+            if self._silero_ready and self._silero_model is not None:
+                try:
+                    # Silero expects audio at 16kHz, so resample if needed
+                    if self._sample_rate != 16000:
+                        # Simple nearest-neighbor downsampling for 44.1kHz -> 16kHz
+                        resample_factor = self._sample_rate / 16000
+                        indices = np.arange(len(audio)) / resample_factor
+                        audio_resampled = np.interp(indices, np.arange(len(audio)), audio)
+                    else:
+                        audio_resampled = audio
+                    
+                    # Convert to torch tensor and run Silero VAD
+                    audio_tensor = torch.from_numpy(audio_resampled).float()
+                    silero_prob = self._silero_model(audio_tensor, 16000).item()
+                    
+                    # Silero returns probability 0-1, use threshold
+                    if silero_prob >= self._silero_confidence_threshold:
+                        # Silero confirms speech - boost confidence
+                        sileo_boost = 15.0  # Boost existing confidence by this much
+                        confidence = min(100.0, confidence + sileo_boost)
+                        if debug:
+                            print(f"  [Silero VAD] Speech prob={silero_prob:.2f} → SPEECH DETECTED (confidence boosted)")
+                    else:
+                        # Silero says not speech - reduce confidence significantly
+                        confidence = max(25.0, confidence * 0.5)
+                        if debug:
+                            print(f"  [Silero VAD] Speech prob={silero_prob:.2f} → NOT SPEECH (confidence reduced)")
+                except Exception as e:
+                    if debug:
+                        print(f"  [Silero ERROR] {str(e)[:80]} - falling back to heuristic")
+                    pass  # Fall back to heuristic if Silero fails
+            
             return confidence
             
         except Exception as e:
             print(f"[VAD EXCEPTION] {str(e)[:100]}")
             return 0.0
+    
+    def _load_silero_vad(self):
+        """Load Silero VAD model in background (one-time, ~40MB download)."""
+        if not HAS_SILERO:
+            return
+        
+        try:
+            print("[Silero VAD] Loading model in background...")
+            self._silero_model = load_silero_vad(onnx=False, force_onnx=False)
+            self._silero_ready = True
+            print("[Silero VAD] ✓ Model loaded successfully")
+        except Exception as e:
+            print(f"[Silero VAD] ✗ Failed to load: {str(e)[:100]}")
+            self._silero_ready = False
     
     def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
         """Check for speech-like modulation at 3-8 Hz (syllabic rate).
@@ -1467,7 +1537,11 @@ class OSINTCOMWindow(QMainWindow):
             
             # Calculate time since last detected word
             time_since_last_word = now - self._last_word_peak_time
-            post_roll_remaining = post_roll_seconds - time_since_last_word
+            post_roll_remaining = max(0, post_roll_seconds - time_since_last_word)
+            
+            # Use post-roll to extend hangover (10 seconds of silence/decay after last word)
+            if post_roll_remaining > 0 and self._recording:
+                self._hangover_remaining = post_roll_remaining
             
             # DEBUG: Show state every ~0.5s
             if self._meter_debug and not hasattr(self, '_last_debug_print'):
@@ -1478,16 +1552,32 @@ class OSINTCOMWindow(QMainWindow):
                 self._last_debug_print = now
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
-            # v1.08: Use hangover behavior (pro squelch)
-            # Voice detected if: confidence > 62 OR hangover still active
+            # v1.08.3: Requires 3.5+ seconds of sustained high confidence to prevent false positives
+            # Voice confidence accumulator
+            if confidence > 60:
+                # Accumulate high-confidence time
+                if self._last_high_confidence_time is None:
+                    self._last_high_confidence_time = time.time()
+                    self._voice_confidence_duration = 0.0
+                else:
+                    dt = time.time() - self._last_high_confidence_time
+                    self._voice_confidence_duration += dt
+                    self._last_high_confidence_time = time.time()
+            else:
+                # Reset accumulator when confidence drops
+                self._voice_confidence_duration = 0.0
+                self._last_high_confidence_time = None
             
-            voice_detected = (confidence > 62) or (self._hangover_remaining > 0)
+            # Voice only counts as "detected" after sustained 3.5 seconds of high confidence
+            # This prevents momentary noise spikes from triggering, but catches real transmissions
+            voice_qualified = self._voice_confidence_duration >= self._voice_confirmation_threshold
+            voice_detected = (voice_qualified) or (self._hangover_remaining > 0)
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
-            # START RECORDING
-            if not self._recording and voice_detected and confidence > 62:
+            # START RECORDING (only after 3.5+ seconds of sustained voice confidence)
+            if not self._recording and voice_detected and voice_qualified:
                 if self._meter_debug:
-                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100 (SNR gate + speech verified)")
+                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100 (sustained {self._voice_confidence_duration:.1f}s)")
                 self._start_recording()
                 self.status_bar.showMessage(f"Recording started | Voice detected (SNR={snr_display:.1f}dB)")
             
@@ -1496,7 +1586,7 @@ class OSINTCOMWindow(QMainWindow):
                 if voice_detected:
                     # Still within hangover window
                     self.status_bar.showMessage(
-                        f"Recording... | Score: {confidence:.0f}/100 | Hangover: {self._hangover_remaining:.2f}s"
+                        f"Recording... | Score: {confidence:.0f}/100 | Duration: {self._voice_confidence_duration:.1f}s | Hangover: {self._hangover_remaining:.2f}s"
                     )
                 else:
                     # Hangover expired, stop recording
