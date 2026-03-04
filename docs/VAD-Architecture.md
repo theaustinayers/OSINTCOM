@@ -4,11 +4,19 @@
 
 **Goal:** Bulletproof voice detection for HF SSB radio with **zero false positives** on static/crashes.
 
-**Philosophy:** Don't rely on a single VAD. Use three independent gates + professional squelch behavior.
+**Philosophy:** Don't rely on a single VAD. Use multiple independent gates + professional squelch behavior.
+
+**Current Implementation (v1.08):**
+- **Gate A:** SNR energy gate (kills static spikes)
+- **Gate B:** WebRTC VAD (Google's trained speech detector)
+- **Gate C:** Speech-likeness verification (3 parallel checks)
+- **Stage D:** Hysteresis + hangover (pro squelch behavior)
+
+All four gates must pass (or Gate B gracefully skipped if not installed) for recording to start.
 
 ---
 
-## Three-Gate Detection Pipeline
+## Four-Stage Detection Pipeline
 
 ### Gate 1: SNR Gate (Cheap, Strict Energy Check)
 
@@ -53,20 +61,32 @@
 
 ### Gate 2: WebRTC VAD (Speech Timing)
 
-**Purpose:** Detect speech-like syllable structure.
+**Purpose:** Detect speech-like syllable structure using Google's trained VAD.
 
-**Implementation:**
+**Implementation (v1.08+):**
 
-1. **WebRTC VAD** (if available)
+1. **WebRTC VAD** (Google's pyaudio-based VAD library)
    - Mode 3 (most aggressive, lowest false positives)
-   - 10–20 ms frames
-   - Detects presence of human speech timing
+   - Processes 20 ms frames (320 samples @ 16 kHz)
+   - Trained on human speech, very reliable
+   - Requires >25% of frames to be speech-active to pass
 
-2. **Fallback** (v1.08 uses custom verifier instead)
-   - If WebRTC not available, use Gate 3 checks below
-   - Current implementation: 3-check speech verification
+2. **Sample Rate Conversion**
+   - Input audio resampled to 16 kHz if necessary
+   - Converted to 16-bit PCM for WebRTC processing
+   - Processed in 20ms chunks
 
-**Note:** v1.08 uses integrated speech-likeness checks (Gate 3) as Van detection rather than external WebRTC library.
+3. **Fallback Behavior**
+   - If WebRTC VAD not installed: Gate B is skipped (assume pass)
+   - Only 3 stages remain active (SNR + formants/modulation/voicing + hangover)
+   - Install with: `pip install webrtcvad`
+
+**Expected Behavior:**
+- Speech: 60-100% frames detected as active → **PASS**
+- Static: <25% frames detected → **FAIL**
+- Crashes: Typically <20% frames → **FAIL**
+
+**Note:** WebRTC VAD is conservative (designed for lowest false positives). Combined with SNR gate + speech verification, provides extremely robust detection.
 
 ---
 

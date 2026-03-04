@@ -27,6 +27,12 @@ try:
 except ImportError:
     HAS_NOISEREDUCE = False
 
+try:
+    import webrtcvad
+    HAS_WEBRTC_VAD = True
+except ImportError:
+    HAS_WEBRTC_VAD = False
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog, QDialog, QLineEdit,
@@ -321,6 +327,16 @@ class OSINTCOMWindow(QMainWindow):
         self._last_relearn_time = time.time()
         self._learning_enabled = True
         self._learning_phase = "startup"  # "startup" or "periodic"
+        
+        # WebRTC VAD initialization (Gate B)
+        if HAS_WEBRTC_VAD:
+            self._webrtc_vad = webrtcvad.Vad(3)  # Mode 3: most aggressive (lowest false positives)
+            self._webrtc_vad_frame_buffer = b''  # Buffer for 20ms frames
+            print("[WebRTC VAD] Initialized in aggressive mode 3 (lowest false positives)")
+        else:
+            self._webrtc_vad = None
+            self._webrtc_vad_frame_buffer = None
+            print("[WARNING] webrtcvad not installed. Gate B (WebRTC VAD) will be skipped. Install with: pip install webrtcvad")
         
         # Audio processing settings
         self._audio_settings = {
@@ -752,7 +768,22 @@ class OSINTCOMWindow(QMainWindow):
                     print(f"[SNR GATE FAIL] {snr_db:.1f} dB < threshold")
                 return 5.0  # Very low but not zero
             
-            # ===== STAGE B: SPEECH-LIKENESS VERIFICATION =====
+            # ===== STAGE B: WEBRTC VAD (SPEECH TIMING CONFIRMATION) =====
+            # Google's WebRTC VAD is trained on human speech
+            # Run only after SNR gate passes (to avoid processing pure noise)
+            if self._webrtc_vad:
+                webrtc_passes = self._check_webrtc_vad(audio, self._sample_rate)
+                if debug:
+                    print(f"  [WebRTC VAD] Pass={webrtc_passes}")
+                if not webrtc_passes:
+                    if debug:
+                        print(f"[WEBRTC GATE FAIL] Non-speech signal")
+                    return 15.0  # Failed WebRTC VAD gate
+            else:
+                if debug:
+                    print(f"  [WebRTC VAD] SKIPPED (not installed)")
+            
+            # ===== STAGE C: SPEECH-LIKENESS VERIFICATION =====
             # Check 1: Harmonic/voicing (pitch detection + spectral flatness)
             flatness = self._spectral_flatness(audio)
             pitch = self._pitch_periodicity(audio)
@@ -877,6 +908,57 @@ class OSINTCOMWindow(QMainWindow):
             return np.clip(peak_ratio, 0, 1.0)
         except:
             return 0.3
+    
+    def _check_webrtc_vad(self, audio: np.ndarray, sample_rate: int) -> bool:
+        """Check for voice activity using Google's WebRTC VAD (Gate B).
+        
+        WebRTC VAD is trained on human speech and is very reliable for
+        detecting speech presence. Requires 16-bit PCM mono audio.
+        
+        Returns: True if speech detected, False otherwise
+        """
+        if not self._webrtc_vad:
+            return True  # If VAD not available, assume speech (don't block it)
+        
+        try:
+            # WebRTC VAD requires 16 kHz sample rate
+            # If input is different, resample or skip this check
+            if sample_rate != 16000:
+                # Resample to 16kHz for WebRTC VAD
+                from scipy.signal import resample
+                num_samples = int(len(audio) * 16000 / sample_rate)
+                audio_16k = resample(audio, num_samples)
+            else:
+                audio_16k = audio
+            
+            # Convert to 16-bit PCM bytes
+            audio_int16 = np.clip(audio_16k * 32768, -32768, 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+            
+            # Process in 20ms frames (320 samples @ 16kHz)
+            frame_size = 320  # 20ms @ 16kHz
+            vad_frames = 0
+            vad_positive = 0
+            
+            for i in range(0, len(audio_bytes) - frame_size * 2, frame_size * 2):
+                frame = audio_bytes[i:i + frame_size * 2]
+                if len(frame) == frame_size * 2:
+                    is_speech = self._webrtc_vad.is_speech(frame, 16000)
+                    vad_frames += 1
+                    if is_speech:
+                        vad_positive += 1
+            
+            # Require at least 25% of frames to be speech-active
+            if vad_frames > 0:
+                speech_ratio = vad_positive / vad_frames
+                return speech_ratio > 0.25
+            else:
+                return True  # Not enough frames, assume pass
+        
+        except Exception as e:
+            if self._meter_debug:
+                print(f"[WebRTC VAD Error] {e}")
+            return True  # If error, assume pass (don't block voice)
     
     def _calculate_confidence(self, audio: np.ndarray, preset: dict) -> float:
         """Calculate voice confidence 0-100 from 5 weighted features.
