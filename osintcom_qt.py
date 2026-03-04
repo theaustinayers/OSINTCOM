@@ -333,9 +333,12 @@ class OSINTCOMWindow(QMainWindow):
         self._calibration_active = False
         self._calibration_samples = []
         self._calibration_start = None
-        self._adaptive_snr_threshold = 13.0  # Default, updated by calibration
+        self._adaptive_snr_threshold = 11.0  # Default, updated by calibration (lowered from 13 for SSB sensitivity)
         self._adaptive_cv_min = 0.25  # Default, updated by calibration (was 0.28)
         self._adaptive_cv_max = 0.60  # Default, updated by calibration (was 0.55)
+        
+        # SSB-friendly SNR gate: use rolling minimum of last 2s (~87 samples at 44kHz/2048 block)
+        self._snr_percentile_window = 87  # ~2 seconds of SNR samples
         
         # Voice confirmation timer - requires 3.5 seconds of sustained high confidence
         self._voice_confidence_duration = 0.0  # Cumulative seconds of high confidence
@@ -838,8 +841,8 @@ class OSINTCOMWindow(QMainWindow):
                 self._noise_floor_rms = 0.001
                 self._snr_history = collections.deque(maxlen=300)
                 self._hangover_remaining = 0.0
-                self._close_threshold = 7.0  # dB SNR
-                self._open_threshold = 12.0  # dB SNR
+                self._close_threshold = 5.0  # dB SNR (more lenient for SSB fading, was 7.0)
+                self._open_threshold = 11.0  # dB SNR (lowered from 12.0 for SSB)
             
             # ===== LEARNING PHASE =====
             if self._learning_phase == "startup":
@@ -869,17 +872,30 @@ class OSINTCOMWindow(QMainWindow):
             self._snr_history.append(snr_db)
             self._last_snr_db = snr_db
             
-            # Hysteresis - balanced thresholds (rejects static but catches voice)
-            # Use adaptive thresholds if calibrated, otherwise use defaults
-            if self._hangover_remaining > 0:
-                snr_gate_passes = snr_db > self._close_threshold  # 7 dB during hangover
+            # For SSB: use rolling minimum SNR (20th percentile) to catch fading signals
+            # This prevents momentary dips from causing false negatives on SSB
+            if len(self._snr_history) > 10:
+                snr_percentile = np.percentile(list(self._snr_history), 20)  # 20th percentile = more lenient than instantaneous
             else:
-                snr_gate_passes = snr_db > self._adaptive_snr_threshold  # Use adaptive threshold
+                snr_percentile = snr_db
+            
+            # Hysteresis - balanced thresholds
+            # For SSB reception: use lenient thresholds to catch fading signals
+            if self._recording:
+                # When already recording: use close threshold (more lenient, 5 dB) to sustain through fades
+                snr_gate_passes = snr_percentile > (self._close_threshold - 2.0)  # 5 dB close threshold
+            elif self._hangover_remaining > 0:
+                # During hangover: use close threshold
+                snr_gate_passes = snr_percentile > self._close_threshold  # 5 dB during hangover
+            else:
+                # Not recording: use open threshold (slightly lower than adaptive for SSB)
+                snr_gate_passes = snr_percentile > max(9.0, self._adaptive_snr_threshold - 2.0)  # More lenient by 2dB for SSB
+            
             self._open_threshold = self._adaptive_snr_threshold
             
             if not snr_gate_passes:
-                if debug and self._hangover_remaining <= 0:
-                    print(f"[SNR GATE FAIL] {snr_db:.1f} dB < threshold {self._adaptive_snr_threshold:.1f}dB")
+                if debug and self._hangover_remaining <= 0 and not self._recording:
+                    print(f"[SNR GATE FAIL] Inst={snr_db:.1f}dB Percentile={snr_percentile:.1f}dB < threshold {max(9.0, self._adaptive_snr_threshold - 2.0):.1f}dB")
                 return 5.0
             
             # ===== STAGE B: SIMPLE MODULATION CHECK (NO SPECTRAL ANALYSIS) =====
