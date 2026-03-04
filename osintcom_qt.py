@@ -333,11 +333,11 @@ class OSINTCOMWindow(QMainWindow):
         self._calibration_active = False
         self._calibration_samples = []
         self._calibration_start = None
-        self._adaptive_snr_threshold = 11.0  # Default, updated by calibration (lowered from 13 for SSB sensitivity)
-        self._adaptive_cv_min = 0.25  # Default, updated by calibration (was 0.28)
-        self._adaptive_cv_max = 0.60  # Default, updated by calibration (was 0.55)
+        self._adaptive_snr_threshold = 8.0  # Lowered from 11 - Silero is primary (was 13 in v1.08.3)
+        self._adaptive_cv_min = 0.25  # Default, updated by calibration
+        self._adaptive_cv_max = 0.60  # Default, updated by calibration
         
-        # SSB-friendly SNR gate: use rolling minimum of last 2s (~87 samples at 44kHz/2048 block)
+        # SSB-friendly SNR gate: use rolling minimum of last 2s
         self._snr_percentile_window = 87  # ~2 seconds of SNR samples
         
         # Voice confirmation timer - requires 3.5 seconds of sustained high confidence
@@ -842,8 +842,8 @@ class OSINTCOMWindow(QMainWindow):
                 self._noise_floor_rms = 0.001
                 self._snr_history = collections.deque(maxlen=300)
                 self._hangover_remaining = 0.0
-                self._close_threshold = 5.0  # dB SNR (more lenient for SSB fading, was 7.0)
-                self._open_threshold = 11.0  # dB SNR (lowered from 12.0 for SSB)
+                self._close_threshold = 2.0  # dB SNR (very lenient during hangover, was 5.0)
+                self._open_threshold = 8.0  # dB SNR (was 11.0, Silero is now primary)
             
             # ===== LEARNING PHASE =====
             if self._learning_phase == "startup":
@@ -895,7 +895,8 @@ class OSINTCOMWindow(QMainWindow):
                 silero_confidence = 50.0
             
             # ===== STAGE B: SNR VALIDATION =====
-            # SNR acts as a secondary check - if too noisy, reduce confidence
+            # SNR acts as a LIGHT sanity check - only reject impossibly noisy audio
+            # Trust Silero for voice detection; SNR just ensures not pure garbage
             rms = np.sqrt(np.mean(audio ** 2))
             snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
             self._snr_history.append(snr_db)
@@ -907,23 +908,24 @@ class OSINTCOMWindow(QMainWindow):
             else:
                 snr_percentile = snr_db
             
-            # SNR check: penalize if REALLY noisy (not rewarded for being quiet)
-            if self._recording:
-                min_snr_threshold = 3.0  # Very lenient when recording (5 - 2)
-            elif self._hangover_remaining > 0:
-                min_snr_threshold = 5.0  # Close threshold
-            else:
-                min_snr_threshold = 9.0  # Open threshold (11 - 2)
-            
-            # If SNR is too low, reduce confidence proportionally
-            if snr_percentile < (min_snr_threshold - 3.0):
-                snr_penalty = max(0, 30 * ((min_snr_threshold - 3.0) - snr_percentile) / 10)  # Steep penalty below
+            # LIGHT SNR check: only penalize if REALLY bad (below -5dB means noise > signal)
+            # Allow Silero to work with fading SSB signals
+            if snr_percentile < -5.0:
+                # Impossibly noisy - heavy penalty
+                snr_penalty = 50.0
+                silero_confidence = max(5.0, silero_confidence - snr_penalty)
+                if debug:
+                    print(f"  [SNR REJECT] {snr_percentile:.1f}dB < -5dB threshold (noise overwhelms signal)")
+            elif snr_percentile < 0.0:
+                # Very noisy but possibly readable - light penalty
+                snr_penalty = 20.0 * (-snr_percentile / 5.0)  # Scale from 0-20 depending on how negative
                 silero_confidence = max(10.0, silero_confidence - snr_penalty)
                 if debug:
-                    print(f"  [SNR Penalty] {snr_percentile:.1f}dB < {min_snr_threshold - 3:.1f}dB → penalty {snr_penalty:.0f}")
+                    print(f"  [SNR LOW] {snr_percentile:.1f}dB between -5 and 0 → penalty {snr_penalty:.0f}")
             else:
+                # SNR is positive - we're good, Silero drives decision
                 if debug:
-                    print(f"  [SNR OK] Percentile {snr_percentile:.1f}dB >= threshold {min_snr_threshold:.1f}dB")
+                    print(f"  [SNR OK] Percentile {snr_percentile:.1f}dB >= 0dB (Silero primary)")
             
             # ===== STAGE C: MODULATION CHECK (speech naturalness) =====
             # Check if audio has natural speech-like modulation
