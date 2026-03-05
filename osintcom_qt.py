@@ -334,9 +334,10 @@ class OSINTCOMWindow(QMainWindow):
         # SSB-friendly SNR gate: use rolling minimum of last 2s
         self._snr_percentile_window = 87  # ~2 seconds of SNR samples
         
-        # Voice confirmation timer - requires 3.5 seconds of sustained high confidence
+        # Voice confirmation timer - requires 2.0 seconds of sustained high confidence
+        # Lowered from 3.5s for faint radio voices with natural pauses
         self._voice_confidence_duration = 0.0  # Cumulative seconds of high confidence
-        self._voice_confirmation_threshold = 3.5  # Seconds of voice confidence needed
+        self._voice_confirmation_threshold = 2.0  # Seconds of voice confidence needed
         self._last_high_confidence_time = None  # Timestamp of last high confidence frame
         
         # Signal-based VAD (no ML dependencies)
@@ -1684,7 +1685,8 @@ class OSINTCOMWindow(QMainWindow):
                 self._last_debug_print = now
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
-            # v1.08.3: Requires 3.5+ seconds of sustained high confidence to prevent false positives
+            # v1.12c: Requires 2.0+ seconds of sustained high confidence for faint radio voices
+            # (lowered from 3.5s to handle natural speech pauses in SSB radio)
             # Lowered confidence thresholds for weak radio signals
             # Voice confidence accumulator
             if confidence > 35:  # Lowered from 45 for weak signals
@@ -1701,7 +1703,7 @@ class OSINTCOMWindow(QMainWindow):
                 self._voice_confidence_duration = 0.0
                 self._last_high_confidence_time = None
             
-            # Voice only counts as "detected" after sustained 3.5 seconds of high confidence
+            # Voice only counts as "detected" after sustained 2.0 seconds of high confidence
             # This prevents momentary noise spikes from triggering, but catches real transmissions
             voice_qualified = self._voice_confidence_duration >= self._voice_confirmation_threshold
             voice_detected = (voice_qualified) or (self._hangover_remaining > 0)
