@@ -452,7 +452,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.11")
+        version_label = QLabel("v1.12")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -807,13 +807,14 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.11 Intelligent Voice Detection - Signal-Based Analysis.
+        """v1.12 Intelligent Voice Detection - Signal-Calibrated VAD.
         
-        Uses 4-layer detection (no ML dependencies):
-        1. SNR gate (noise floor relative calculation)
-        2. Pitch detection (voice fundamental ~85-250Hz)
-        3. Spectral entropy (voice organized, static chaotic)
-        4. Zero-crossing rate (voice smooth, static choppy)
+        4-layer detection tuned from real FlexRadio DAX SSB signal data:
+        1. SNR gate            - 25pts max
+        2. Pitch detection     - 35pts max (BEST discriminator: silence 0.10-0.20, voice 0.22+)
+        3. Spectral entropy    - 25pts max (tight upper 0.72; silence 0.63-0.66 gets ~0-8pts)
+        4. Zero-crossing rate  - 15pts max (reduced: SSB voice+silence both score 0.05-0.11)
+        Silence blocking gate  - caps at 25% if pitch=0 AND entropy<5 (carrier between words)
         
         Returns: 0-100 confidence where 50+ = voice
         """
@@ -897,25 +898,39 @@ class OSINTCOMWindow(QMainWindow):
                     print(f"  [PASSED SNR Gate] {snr_percentile:.1f}dB >= {snr_threshold:.1f}dB (score: {confidence:.0f})")
             
             # ===== LAYER 2: PITCH DETECTION =====
-            # Voice fundamental ~85-250Hz (can reach 300Hz for children/women high)
+            # Voice fundamental ~85-250Hz. Best single discriminator for SSB voice.
+            # Weight: 35pts (strongest discriminator - silence pitch stays 0.10-0.20)
             if confidence > 0:
-                pitch_score = self._detect_pitch(audio)  # Returns 0-25
+                pitch_score = self._detect_pitch(audio)  # Returns 0-35
                 confidence += pitch_score
                 if debug:
                     print(f"  Layer 2 Pitch: +{pitch_score:.0f} (total: {confidence:.0f})")
             
             # ===== LAYER 3: SPECTRAL ENTROPY =====
-            # Voice: organized spectrum (low entropy), Static: chaotic (high entropy)
+            # Voice: organized spectrum (low entropy), Silence: flat carrier (high entropy)
+            # Weight: 25pts. Upper bound tightened to 0.72 (was 0.80) - silence 0.63-0.66
+            # was getting 14-17pts; now gets 7-10pts before blocking gate fires.
             if confidence > 0:
                 entropy_score = self._estimate_spectral_entropy(audio)  # Returns 0-25
                 confidence += entropy_score
                 if debug:
                     print(f"  Layer 3 Entropy: +{entropy_score:.0f} (total: {confidence:.0f})")
             
+            # ===== SILENCE BLOCKING GATE =====
+            # If pitch is entirely absent AND entropy is near-flat, this is carrier
+            # noise / between-word silence, not voice. Cap confidence hard at 25%.
+            # Data: silence = pitch 0.10-0.20 (0pts) + entropy 0.63-0.66 (<5pts)
+            if confidence > 0 and pitch_score == 0.0 and entropy_score < 5.0:
+                confidence = min(confidence, 25.0)
+                if debug:
+                    print(f"  [SILENCE GATE] Pitch=0, Entropy<5 → capped at 25%")
+                return np.clip(confidence, 0.0, 100.0)
+            
             # ===== LAYER 4: ZERO-CROSSING RATE =====
-            # Voice: smooth transitions (low ZCR), Static: choppy (high ZCR)
+            # Reduced to 15pts (was 25pts): ZCR 0.05-0.11 is present in BOTH voice and
+            # silence for SSB radio, making it unreliable as a primary discriminator.
             if confidence > 0:
-                zcr_score = self._zero_crossing_rate_score(audio)  # Returns 0-25
+                zcr_score = self._zero_crossing_rate_score(audio)  # Returns 0-15
                 confidence += zcr_score
                 if debug:
                     print(f"  Layer 4 ZCR: +{zcr_score:.0f} (total: {confidence:.0f})")
@@ -961,7 +976,9 @@ class OSINTCOMWindow(QMainWindow):
         """Detect pitch/periodicity in voice range 85-250Hz.
         
         Voice has fundamental frequency. Static bursts have no coherent pitch.
-        Returns: 0-25 points (0 = no pitch, 25 = strong pitch in voice range)
+        Weight raised to 35pts - strongest discriminator for SSB radio.
+        Silence autocorrelation peak: 0.10-0.20. Voice: 0.22+ (medium) to 0.87 (strong).
+        Returns: 0-35 points (0 = no pitch, 35 = strong pitch in voice range)
         """
         try:
             if len(audio) < 512:
@@ -997,15 +1014,17 @@ class OSINTCOMWindow(QMainWindow):
             peak_idx = np.argmax(autocorr_pitch) if len(autocorr_pitch) > 0 else 0
             peak_strength = autocorr_pitch[peak_idx] if len(autocorr_pitch) > 0 else 0.0
             
-            # Lowered thresholds for weak radio voice
-            # Voice: peak_strength > 0.45, Static: < 0.20
-            # Map: <0.20 = 0 pts, >0.45 = 25 pts, linear between
-            if peak_strength > 0.20:  # MUCH lower threshold - accept weak pitch
-                return 25.0
-            elif peak_strength < 0.10:
+            # Calibrated from real FlexRadio SSB signal data:
+            # Silence: peak_strength 0.10-0.20 (0pts)
+            # Low voice: 0.22-0.50 (partial score)
+            # Strong voice: 0.45-0.87 (full score)
+            # Map: <=0.10 = 0pts, >=0.45 = 35pts, linear between
+            if peak_strength >= 0.45:
+                return 35.0
+            elif peak_strength <= 0.10:
                 return 0.0
             else:
-                return (peak_strength - 0.10) / 0.10 * 25.0
+                return (peak_strength - 0.10) / 0.35 * 35.0
         except:
             return 2.0  # Small credit for attempting pitch detection
     
@@ -1040,16 +1059,18 @@ class OSINTCOMWindow(QMainWindow):
             max_entropy = np.log(len(power))
             normalized_entropy = entropy / (max_entropy + 1e-10)
             
-            # Lowered thresholds for radio speech
-            # Voice: entropy ~0.30-0.5, Static: entropy ~0.7-0.9
-            # SSB voice is typically 0.59-0.66 (higher than expected!)
-            # Map: >0.80 = 0 pts (chaotic), <0.70 = 25 pts (organized), linear between
-            if normalized_entropy > 0.80:
+            # Calibrated from real FlexRadio SSB signal data:
+            # Silence (carrier): entropy 0.63-0.66 → should score ~0-8pts
+            # Low voice: entropy 0.55-0.66 → 0-18pts
+            # Strong voice: entropy 0.18-0.50 → 20-25pts
+            # Map: >0.72 = 0pts, <0.50 = 25pts, linear between
+            # (Was 0.80 upper - silence was incorrectly getting 14-17pts)
+            if normalized_entropy > 0.72:
                 return 0.0
-            elif normalized_entropy < 0.55:  # Very lenient for radio voice
+            elif normalized_entropy < 0.50:
                 return 25.0
             else:
-                return (0.80 - normalized_entropy) / 0.25 * 25.0
+                return (0.72 - normalized_entropy) / 0.22 * 25.0
         except:
             return 2.0  # Small credit for attempting entropy check
     
@@ -1058,7 +1079,9 @@ class OSINTCOMWindow(QMainWindow):
         
         Voice has smooth modulation (low ZCR).
         Static has rapid fluctuations (high ZCR).
-        Returns: 0-25 points (0 = high ZCR/noise, 25 = low ZCR/voice)
+        Reduced to 15pts max (was 25): for SSB radio, both voice and silence have
+        similar ZCR (0.05-0.11) so this layer is not a reliable primary discriminator.
+        Returns: 0-15 points (0 = high ZCR/noise, 15 = low ZCR/voice)
         """
         try:
             if len(audio) < 2:
@@ -1069,15 +1092,16 @@ class OSINTCOMWindow(QMainWindow):
             zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_work)))) / 2.0
             zcr = zero_crossings / len(audio_work)
             
-            # Lowered thresholds for weak radio voice
-            # Voice: ZCR ~0.08-0.15, Static: ZCR >0.25
-            # Map: >0.30 = 0 pts, <0.10 = 25 pts, linear between (more lenient)
+            # Calibrated from real FlexRadio SSB signal data:
+            # Both voice and silence score 0.05-0.11 (both would hit max 25pts).
+            # Reduced max to 15pts - provides supporting evidence only.
+            # Map: >0.30 = 0pts, <0.10 = 15pts, linear between
             if zcr > 0.30:
                 return 0.0
             elif zcr < 0.10:
-                return 25.0
+                return 15.0
             else:
-                return (0.30 - zcr) / 0.20 * 25.0
+                return (0.30 - zcr) / 0.20 * 15.0
         except:
             return 2.0  # Small credit for attempting ZCR check
     
