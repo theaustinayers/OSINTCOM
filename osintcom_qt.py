@@ -1000,12 +1000,12 @@ class OSINTCOMWindow(QMainWindow):
             # Lowered thresholds for weak radio voice
             # Voice: peak_strength > 0.45, Static: < 0.20
             # Map: <0.20 = 0 pts, >0.45 = 25 pts, linear between
-            if peak_strength > 0.45:
+            if peak_strength > 0.20:  # MUCH lower threshold - accept weak pitch
                 return 25.0
-            elif peak_strength < 0.20:
+            elif peak_strength < 0.10:
                 return 0.0
             else:
-                return (peak_strength - 0.20) / 0.25 * 25.0
+                return (peak_strength - 0.10) / 0.10 * 25.0
         except:
             return 2.0  # Small credit for attempting pitch detection
     
@@ -1041,14 +1041,15 @@ class OSINTCOMWindow(QMainWindow):
             normalized_entropy = entropy / (max_entropy + 1e-10)
             
             # Lowered thresholds for radio speech
-            # Voice: entropy ~0.3-0.5, Static: entropy ~0.7-0.9
-            # Map: >0.65 = 0 pts (chaotic), <0.45 = 25 pts (organized), linear between
-            if normalized_entropy > 0.65:
+            # Voice: entropy ~0.30-0.5, Static: entropy ~0.7-0.9
+            # SSB voice is typically 0.59-0.66 (higher than expected!)
+            # Map: >0.80 = 0 pts (chaotic), <0.70 = 25 pts (organized), linear between
+            if normalized_entropy > 0.80:
                 return 0.0
-            elif normalized_entropy < 0.45:
+            elif normalized_entropy < 0.55:  # Very lenient for radio voice
                 return 25.0
             else:
-                return (0.65 - normalized_entropy) / 0.20 * 25.0
+                return (0.80 - normalized_entropy) / 0.25 * 25.0
         except:
             return 2.0  # Small credit for attempting entropy check
     
@@ -1653,8 +1654,9 @@ class OSINTCOMWindow(QMainWindow):
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
             # v1.08.3: Requires 3.5+ seconds of sustained high confidence to prevent false positives
+            # Lowered confidence thresholds for weak radio signals
             # Voice confidence accumulator
-            if confidence > 45:  # Lowered from 60 for weak radio signals
+            if confidence > 35:  # Lowered from 45 for weak signals
                 # Accumulate high-confidence time
                 if self._last_high_confidence_time is None:
                     self._last_high_confidence_time = time.time()
