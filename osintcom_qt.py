@@ -682,6 +682,11 @@ class OSINTCOMWindow(QMainWindow):
         self._calibration_active = True
         self.status_bar.showMessage("🎤 CALIBRATING... Do not speak (10s)")
         
+        # Turn button red to indicate active calibration
+        self.calibrate_btn.setStyleSheet(
+            "QPushButton { background-color: #FF4444; color: white; font-weight: bold; }"
+        )
+        
         # After 10 seconds, analyze and adjust
         QTimer.singleShot(10000, self._analyze_calibration)
 
@@ -692,6 +697,7 @@ class OSINTCOMWindow(QMainWindow):
         if len(self._calibration_samples) < 100:
             self.status_bar.showMessage("Calibration failed: insufficient audio samples")
             self.calibrate_btn.setEnabled(True)
+            self.calibrate_btn.setStyleSheet("")  # Reset button style
             return
         
         try:
@@ -722,9 +728,9 @@ class OSINTCOMWindow(QMainWindow):
             # If noise is high energy, raise SNR gate
             # If noise has high modulation (variable), tighten CV range
             
-            old_snr = self._open_threshold
-            old_cv_min = 0.28
-            old_cv_max = 0.55
+            old_snr = self._adaptive_snr_threshold
+            old_cv_min = self._adaptive_cv_min
+            old_cv_max = self._adaptive_cv_max
             
             # Adaptive SNR: noise SNR was X, so require human voice to be at least +4dB above that
             new_snr = max(13.0, snr_db_noise + 4.0)  # At least 13 dB floor
@@ -759,6 +765,7 @@ class OSINTCOMWindow(QMainWindow):
             QMessageBox.warning(self, "Calibration Error", f"Failed to analyze noise: {str(e)[:100]}")
         finally:
             self.calibrate_btn.setEnabled(True)
+            self.calibrate_btn.setStyleSheet("")  # Reset button style to normal
             self._calibration_samples = []
 
     def _start_audio_stream(self):
