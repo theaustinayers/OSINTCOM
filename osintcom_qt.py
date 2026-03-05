@@ -19,20 +19,14 @@ import uuid
 import numpy as np
 import sounddevice as sd
 import requests
-from scipy.signal import butter, sosfiltfilt, welch, get_window
-from scipy.fftpack import fft
+# scipy imports removed - using numpy-only signal processing now
+# from scipy.signal import butter, sosfiltfilt, welch, get_window
+# from scipy.fftpack import fft
 try:
     import noisereduce as nr
     HAS_NOISEREDUCE = True
 except ImportError:
     HAS_NOISEREDUCE = False
-
-try:
-    import torch
-    from silero_vad import load_silero_vad
-    HAS_SILERO = True
-except ImportError:
-    HAS_SILERO = False
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -345,18 +339,9 @@ class OSINTCOMWindow(QMainWindow):
         self._voice_confirmation_threshold = 3.5  # Seconds of voice confidence needed
         self._last_high_confidence_time = None  # Timestamp of last high confidence frame
         
-        # Silero VAD model (loaded on background thread on startup)
+        # Signal-based VAD (no ML dependencies)
         self._silero_model = None
         self._silero_ready = False
-        self._silero_fallback_mode = True  # If Silero fails, use heuristic VAD as fallback
-        self._silero_use_threshold = 0.4  # Lower threshold (more sensitive to Silero detection)
-        self._silero_confidence_threshold = 0.5
-        self._silero_confidence_threshold = 0.5  # Speech probability threshold (0-1)
-        if HAS_SILERO:
-            # Load Silero VAD in background to avoid blocking UI
-            threading.Thread(target=self._load_silero_vad, daemon=True).start()
-        else:
-            print("[WARNING] silero-vad not installed - using heuristic VAD only")
         
         # Audio processing settings
         self._audio_settings = {
@@ -822,12 +807,13 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.10c SILERO-FIRST: ML-based speech detection as PRIMARY gate.
+        """v1.11 Intelligent Voice Detection - Signal-Based Analysis.
         
-        Primary: Silero VAD (0.4+ = voice, most accurate for SSB)
-        Fallback: SNR+Modulation (if Silero unavailable)
-        Validator: SNR (reject impossibly noisy)
-        Confirmation: Modulation (natural speech patterns)
+        Uses 4-layer detection (no ML dependencies):
+        1. SNR gate (noise floor relative calculation)
+        2. Pitch detection (voice fundamental ~85-250Hz)
+        3. Spectral entropy (voice organized, static chaotic)
+        4. Zero-crossing rate (voice smooth, static choppy)
         
         Returns: 0-100 confidence where 50+ = voice
         """
@@ -870,109 +856,69 @@ class OSINTCOMWindow(QMainWindow):
                     self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01
                     self._last_relearn_time = now
             
-            # ===== PRIMARY DETECTION STRATEGY =====
-            # If Silero VAD is ready: use it as PRIMARY gate
-            # Otherwise: fall back to proven SNR+modulation
+            # ===== 4-LAYER INTELLIGENT VOICE DETECTION =====
+            # Layer 1: SNR gate (foundation)
+            # Layer 2: Pitch detection (voice has fundamental frequency ~85-250Hz)
+            # Layer 3: Spectral entropy (voice organized, static chaotic)
+            # Layer 4: Zero-crossing rate (voice smooth, static choppy)
             
-            use_silero = self._silero_ready and self._silero_model is not None
+            confidence = 0.0
+            rms = np.sqrt(np.mean(audio ** 2))
+            snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
+            self._snr_history.append(snr_db)
+            self._last_snr_db = snr_db
             
-            if use_silero:
-                # ===== SILERO FIRST: ML-based speech detection =====
-                confidence = 0.0
-                try:
-                    # Resample to 16kHz
-                    if self._sample_rate != 16000:
-                        resample_factor = self._sample_rate / 16000
-                        indices = np.arange(len(audio)) / resample_factor
-                        audio_resampled = np.interp(indices, np.arange(len(audio)), audio)
-                    else:
-                        audio_resampled = audio
-                    
-                    # Run Silero VAD
-                    audio_tensor = torch.from_numpy(audio_resampled).float()
-                    silero_prob = self._silero_model(audio_tensor, 16000).item()
-                    
-                    # Convert to confidence (0-100)
-                    if silero_prob >= self._silero_use_threshold:
-                        confidence = 60.0 + (silero_prob * 40.0)  # 60-100 for voice
-                    else:
-                        confidence = silero_prob * 50.0  # 0-50 for non-speech
-                    
-                    # SNR validation: penalize if impossibly noisy
-                    rms = np.sqrt(np.mean(audio ** 2))
-                    snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
-                    self._snr_history.append(snr_db)
-                    self._last_snr_db = snr_db
-                    
-                    if len(self._snr_history) > 10:
-                        snr_percentile = np.percentile(list(self._snr_history), 20)
-                    else:
-                        snr_percentile = snr_db
-                    
-                    # Only penalize if SNR is catastrophically bad
-                    if snr_percentile < -3.0:
-                        confidence = max(10.0, confidence - 30.0)
-                        if debug:
-                            print(f"[Silero] SNR penalty: {snr_percentile:.1f}dB < -3dB threshold")
-                    
-                    # Modulation check: boost if natural, reduce if chaotic
-                    chunk_size = len(audio) // 10
-                    if chunk_size > 0:
-                        rms_values = []
-                        for i in range(10):
-                            start = i * chunk_size
-                            end = start + chunk_size if i < 9 else len(audio)
-                            chunk_rms = np.sqrt(np.mean(audio[start:end] ** 2))
-                            rms_values.append(chunk_rms)
-                        
-                        rms_values = np.array(rms_values, dtype=np.float32)
-                        rms_mean = np.mean(rms_values)
-                        if rms_mean > 1e-10:
-                            cv = np.sqrt(np.var(rms_values)) / rms_mean
-                        else:
-                            cv = 0.0
-                        
-                        if self._adaptive_cv_min < cv < self._adaptive_cv_max:
-                            confidence = min(100.0, confidence + 5.0)
-                            if debug:
-                                print(f"[Silero] CV={cv:.2f} natural → +5 boost (total {confidence:.0f})")
-                        else:
-                            confidence = max(10.0, confidence - 5.0)
-                            if debug:
-                                print(f"[Silero] CV={cv:.2f} unnatural → -5 penalty (total {confidence:.0f})")
-                    
-                    if debug:
-                        print(f"[Detection] Silero={silero_prob:.2f} + SNR={snr_percentile:.1f}dB → Confidence={confidence:.0f}/100")
-                        
-                except Exception as e:
-                    if debug:
-                        print(f"[Silero FAILED] {str(e)[:60]} - falling back to heuristic")
-                    use_silero = False  # Fall back to heuristic
+            if len(self._snr_history) > 10:
+                snr_percentile = np.percentile(list(self._snr_history), 20)
+            else:
+                snr_percentile = snr_db
             
-            if not use_silero:
-                # ===== FALLBACK: SNR + Modulation (proven working) =====
-                rms = np.sqrt(np.mean(audio ** 2))
-                snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
-                self._snr_history.append(snr_db)
-                self._last_snr_db = snr_db
-                
-                if len(self._snr_history) > 10:
-                    snr_percentile = np.percentile(list(self._snr_history), 20)
-                else:
-                    snr_percentile = snr_db
-                
-                # SNR gate
-                if self._recording:
-                    snr_passes = snr_percentile > 0.0
-                elif self._hangover_remaining > 0:
-                    snr_passes = snr_percentile > 2.0
-                else:
-                    snr_passes = snr_percentile > 6.0
-                
-                if not snr_passes:
-                    return 5.0
-                
-                # Modulation check
+            # ===== LAYER 1: SNR GATE =====
+            # Determine thresholds based on state
+            if self._recording:
+                snr_threshold = 0.0
+            elif self._hangover_remaining > 0:
+                snr_threshold = 2.0
+            else:
+                snr_threshold = 6.0
+            
+            snr_passes = snr_percentile > snr_threshold
+            
+            # Layer 1 score: 0-25 points (gate + bonus)
+            if not snr_passes:
+                confidence = 0.0  # SNR gate fails - everything fails
+            else:
+                confidence = 20.0  # Base score for passing SNR
+                if snr_percentile > snr_threshold + 3.0:
+                    confidence = 25.0  # Bonus for strong SNR
+            
+            # ===== LAYER 2: PITCH DETECTION =====
+            # Voice fundamental ~85-250Hz (can reach 300Hz for children/women high)
+            if confidence > 0:
+                pitch_score = self._detect_pitch(audio)  # Returns 0-25
+                confidence += pitch_score
+                if debug:
+                    print(f"  Layer 2 Pitch: +{pitch_score:.0f} (total: {confidence:.0f})")
+            
+            # ===== LAYER 3: SPECTRAL ENTROPY =====
+            # Voice: organized spectrum (low entropy), Static: chaotic (high entropy)
+            if confidence > 0:
+                entropy_score = self._estimate_spectral_entropy(audio)  # Returns 0-25
+                confidence += entropy_score
+                if debug:
+                    print(f"  Layer 3 Entropy: +{entropy_score:.0f} (total: {confidence:.0f})")
+            
+            # ===== LAYER 4: ZERO-CROSSING RATE =====
+            # Voice: smooth transitions (low ZCR), Static: choppy (high ZCR)
+            if confidence > 0:
+                zcr_score = self._zero_crossing_rate_score(audio)  # Returns 0-25
+                confidence += zcr_score
+                if debug:
+                    print(f"  Layer 4 ZCR: +{zcr_score:.0f} (total: {confidence:.0f})")
+            
+            # ===== MODULATION CHECK: Boost/Penalty =====
+            # Natural voice has 0.25-0.60 coefficient of variation
+            if confidence > 0:
                 chunk_size = len(audio) // 10
                 if chunk_size > 0:
                     rms_values = []
@@ -989,36 +935,143 @@ class OSINTCOMWindow(QMainWindow):
                     else:
                         cv = 0.0
                     
-                    has_modulation = self._adaptive_cv_min < cv < self._adaptive_cv_max
-                    confidence = 75.0 if has_modulation else 25.0
-                    
-                    if debug:
-                        print(f"[Detection] Fallback: SNR={snr_percentile:.1f}dB + CV={cv:.2f} → Confidence={confidence:.0f}/100")
-                else:
-                    confidence = 50.0
+                    if self._adaptive_cv_min < cv < self._adaptive_cv_max:
+                        confidence = min(100.0, confidence + 5.0)
+                        if debug:
+                            print(f"  Modulation: CV={cv:.2f} natural → +5 (total: {confidence:.0f})")
+                    else:
+                        confidence = max(5.0, confidence - 5.0)
+                        if debug:
+                            print(f"  Modulation: CV={cv:.2f} unnatural → -5 (total: {confidence:.0f})")
             
             if debug:
-                print(f"[RESULT] Score={confidence:.0f}/100 | SNR={snr_db:.1f}dB | Hangover={self._hangover_remaining:.2f}s")
+                print(f"[VOICE] SNR={snr_percentile:.1f}dB | Confidence={confidence:.0f}/100 | Hangover={self._hangover_remaining:.2f}s")
             
-            return confidence
+            return np.clip(confidence, 0.0, 100.0)
             
         except Exception as e:
             print(f"[VAD EXCEPTION] {str(e)[:100]}")
             return 0.0
     
-    def _load_silero_vad(self):
-        """Load Silero VAD model in background (one-time, ~40MB download)."""
-        if not HAS_SILERO:
-            return
+    def _detect_pitch(self, audio: np.ndarray) -> float:
+        """Detect pitch/periodicity in voice range 85-250Hz.
         
+        Voice has fundamental frequency. Static bursts have no coherent pitch.
+        Returns: 0-25 points (0 = no pitch, 25 = strong pitch in voice range)
+        """
         try:
-            print("[Silero VAD] Loading model in background...")
-            self._silero_model = load_silero_vad(onnx=False, force_onnx=False)
-            self._silero_ready = True
-            print("[Silero VAD] ✓ Model loaded successfully")
-        except Exception as e:
-            print(f"[Silero VAD] ✗ Failed to load: {str(e)[:100]}")
-            self._silero_ready = False
+            if len(audio) < 512:
+                return 0.0
+            
+            # Compute autocorrelation to find pitch
+            # Voice pitch is typically 85 Hz (male) to 250 Hz (female/child)
+            # At 44100 Hz sampling: 85 Hz = ~519 samples, 250 Hz = ~176 samples
+            
+            audio_work = audio - np.mean(audio)  # Remove DC
+            if np.max(np.abs(audio_work)) < 1e-10:
+                return 0.0
+            
+            # Autocorrelation using FFT (fast)
+            fft = np.fft.fft(audio_work, n=2*len(audio_work))
+            power = fft * np.conj(fft)
+            autocorr = np.fft.ifft(power)[0:len(audio_work)]
+            autocorr = np.real(autocorr)
+            autocorr = autocorr / autocorr[0]  # Normalize
+            
+            # Look for peaks in pitch range
+            # Min lag: 44100 Hz / 250 Hz = 176 samples
+            # Max lag: 44100 Hz / 85 Hz = 519 samples
+            min_lag = max(10, int(self._sample_rate / 250))  # ~176 @ 44.1kHz
+            max_lag = min(len(autocorr)-1, int(self._sample_rate / 85))  # ~519 @ 44.1kHz
+            
+            if max_lag <= min_lag:
+                return 0.0
+            
+            autocorr_pitch = autocorr[min_lag:max_lag]
+            
+            # Find strongest peak in pitch range
+            peak_idx = np.argmax(autocorr_pitch) if len(autocorr_pitch) > 0 else 0
+            peak_strength = autocorr_pitch[peak_idx] if len(autocorr_pitch) > 0 else 0.0
+            
+            # Voice: peak_strength > 0.6, Static: < 0.3
+            # Map: <0.3 = 0 pts, >0.6 = 25 pts, linear between
+            if peak_strength > 0.60:
+                return 25.0
+            elif peak_strength < 0.30:
+                return 0.0
+            else:
+                return (peak_strength - 0.30) / 0.30 * 25.0
+        except:
+            return 0.0
+    
+    def _estimate_spectral_entropy(self, audio: np.ndarray) -> float:
+        """Estimate spectral entropy - low for voice, high for static.
+        
+        Voice has organized spectrum with formants.
+        Static has relatively flat spectrum.
+        Returns: 0-25 points (0 = chaotic/noise, 25 = organized/voice)
+        """
+        try:
+            if len(audio) < 512:
+                return 0.0
+            
+            # Compute power spectral density via simple FFT
+            audio_work = audio - np.mean(audio)
+            # Use Hamming window to reduce spectral leakage
+            window = np.hamming(len(audio_work))
+            audio_windowed = audio_work * window
+            
+            fft_data = np.fft.rfft(audio_windowed)
+            power = np.abs(fft_data) ** 2
+            power = power / (np.sum(power) + 1e-10)  # Normalize to probability distribution
+            
+            # Shannon entropy: -sum(p * log(p))
+            # Low entropy = concentrated energy (voice)
+            # High entropy = spread energy (static)
+            power_clipped = np.clip(power, 1e-10, 1.0)
+            entropy = -np.sum(power_clipped * np.log(power_clipped + 1e-10))
+            
+            # Normalize by max entropy (uniform distribution)
+            max_entropy = np.log(len(power))
+            normalized_entropy = entropy / (max_entropy + 1e-10)
+            
+            # Voice: entropy ~0.3-0.5, Static: entropy ~0.7-0.9
+            # Map: >0.7 = 0 pts (chaotic), <0.5 = 25 pts (organized), linear between
+            if normalized_entropy > 0.70:
+                return 0.0
+            elif normalized_entropy < 0.50:
+                return 25.0
+            else:
+                return (0.70 - normalized_entropy) / 0.20 * 25.0
+        except:
+            return 0.0
+    
+    def _zero_crossing_rate_score(self, audio: np.ndarray) -> float:
+        """Calculate zero-crossing rate - low for voice, high for static.
+        
+        Voice has smooth modulation (low ZCR).
+        Static has rapid fluctuations (high ZCR).
+        Returns: 0-25 points (0 = high ZCR/noise, 25 = low ZCR/voice)
+        """
+        try:
+            if len(audio) < 2:
+                return 0.0
+            
+            # Count sign changes in audio signal
+            audio_work = audio - np.mean(audio)
+            zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_work)))) / 2.0
+            zcr = zero_crossings / len(audio_work)
+            
+            # Voice: ZCR ~0.08-0.15, Static: ZCR >0.25
+            # Map: >0.25 = 0 pts, <0.15 = 25 pts, linear between
+            if zcr > 0.25:
+                return 0.0
+            elif zcr < 0.15:
+                return 25.0
+            else:
+                return (0.25 - zcr) / 0.10 * 25.0
+        except:
+            return 0.0
     
     def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
         """Check for speech-like modulation at 3-8 Hz (syllabic rate).
