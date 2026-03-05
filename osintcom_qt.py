@@ -1710,6 +1710,13 @@ class OSINTCOMWindow(QMainWindow):
             # Voice only counts as "detected" after sustained 2.0 seconds of high confidence
             # This prevents momentary noise spikes from triggering, but catches real transmissions
             voice_qualified = self._voice_confidence_duration >= self._voice_confirmation_threshold
+            
+            # During recording: Use lower stop threshold to exit cleanly
+            # If confidence drops below stop_threshold, force stop (don't wait for hangover)
+            if self._recording and confidence < stop_threshold:
+                voice_qualified = False
+                self._voice_confidence_duration = 0.0  # Reset accumulator
+            
             voice_detected = (voice_qualified) or (self._hangover_remaining > 0)
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
