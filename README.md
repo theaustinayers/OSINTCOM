@@ -1,20 +1,364 @@
-# OSINTCOM v1.0
+# OSINTCOM v1.13
 
-Professional-grade **voice activity detection (VAD) and recording tool** for HF radio SSB monitoring with Discord integration. Captures faint voice while rejecting static noise.
+**Professional-grade Voice Activity Detection (VAD) and recording system for HF radio SSB monitoring with intelligent noise rejection and Discord integration.**
 
-![OSINTCOM GUI](screenshot.png)
+![OSINTCOM v1.13 Interface](screenshot.png)
 
-**Features:**
-- 🎙️ Real-time audio monitoring with visual meter
-- 🔊 Listens to **Mic In** or **Speaker Output** (WASAPI loopback on Windows)
-- 🎯 **SSB-optimized VAD** with 5 sensitivity levels (rejects static, catches faint voice)
-- 📊 Spectral analysis for intelligent static rejection
-- ⏱️ Records **5 seconds pre-voice + 10 seconds post-silence** (countdown resets on new voice)
-- 📁 Saves as 16-bit PCM WAV files
-- 🔗 Discord webhook integration with custom messages & role pings
-- 🔇 Optional noise reduction filter (noisereduce)
-- 🎨 Modern dark theme GUI with live frequency/status display
-- 💾 Standalone .exe for Windows (no Python installation required)
+---
+
+## About OSINTCOM
+
+OSINTCOM is a **feature-rich VAD recording tool** designed for **HF radio monitoring, EAM (Emergency Action Message) detection, and emergency communications**. It captures faint voice transmissions in high-noise environments while intelligently filtering out static, QRM, and atmospheric noise.
+
+Perfect for:
+- 🎙️ HF radio monitoring (SSB, CW, EAM)
+- 🚨 Emergency communications surveillance
+- 📡 Signal intelligence operations
+- 🔊 Audio archival and research
+
+---
+
+## 🎯 Core Features
+
+### Voice Activity Detection (VAD)
+- **5-Level Sensitivity Presets** (L1-L5): Adjust confidence thresholds from 46% to 65%
+- **Multi-Layer Confidence Scoring**: SNR + pitch + entropy + zero-crossing rate + spectral variation
+- **Intelligent SNR Gating**: Recording starts at SNR > 3dB, hangover resets at SNR > 4dB + confidence > 60%
+- **Periodic Auto-Calibration**: Recalibrates noise floor every 5 minutes (skips during active voice)
+- **Dynamic Threshold Scheduling**: 55% idle, 52% recording, 60% hangover (adapts by state)
+
+### Recording & Processing
+- **Smart Pre/Post-Roll**: 5 seconds pre-voice capture + 10-second hangover post-silence
+- **Hangover Reset Logic**: 10-frame silence detector (52% confidence) or new voice triggers recording stop
+- **Minimum Duration Filter**: 1.1s of sustained voice required for upload (prevents false positives)
+- **Audio Processing Pipeline**:
+  - 🎚️ **Voice Extraction Slider** (45-70%): Adjustable confidence threshold for voice-only segments
+  - 🔊 **Bandpass Filter** (300-3000 Hz): SSB radio optimized, removes out-of-band noise
+  - 🔇 **Enhanced Noise Reduction**: noisereduce library with tunable strength (1-10)
+  - 🔇 **Silence Gap Removal**: Eliminates quiet periods between speech bursts
+- **WAV Export**: 16-bit PCM mono at original sample rate
+
+### Discord Integration
+- **Multi-Webhook Management**:
+  - ➕ Add unlimited Discord webhook destinations
+  - 🏷️ Custom nicknames for each webhook (e.g., "Main Server", "Backup", "Archive")
+  - ✅ Per-webhook enable/disable toggle (selective routing without deletion)
+  - 📌 Per-webhook role ID support (customize who gets pinged on each server)
+- **Automatic Upload**: Sends completed recordings to all enabled webhooks simultaneously
+- **Custom Messages**: Customize Discord message template (e.g., "***EAM INCOMING***")
+- **Rich Embeds**: Frequency, timestamp, and color-coded alerts
+
+### User Interface
+- **Real-Time Audio Meter**: Live dB level with gradient (green → yellow → red)
+- **Animated Alert Ticker**: "***EAM INCOMING***" scrolls with flashing effect on black background
+  - ShareTechMono font for authentic emergency broadcast aesthetic
+  - Auto-triggers on recording start, auto-stops on recording end
+- **Frequency Presets**: HFGCS frequencies (4.724 - 18.046 MHz) + custom frequency entry
+- **Status Indicators**:
+  - Voice detection status (green/red)
+  - Sensitivity level display
+  - Recording state with duration counter
+  - Hangover countdown timer
+  - Confidence score percentage
+  - Noise floor measurement
+- **Dark Theme GUI**: Modern flat design, easy on eyes during long monitoring sessions
+
+### Configuration & Settings
+- **Audio Settings Dialog**:
+  - Bandpass filter toggle
+  - Denoise strength slider (1-10)
+  - Silence removal toggle
+  - Voice extraction toggle + confidence slider (45-70%)
+- **Auto-Save Config**: Settings persist in `osintcom_config.json`
+- **Device Selection**: Choose from all available audio inputs (mic, loopback, USB, etc.)
+- **File Location Picker**: Set custom save directory for recordings
+- **Sensitivity Calibration**: Manual noise floor measurement (10-second collection)
+
+---
+
+## Installation
+
+### Option 1: Standalone Windows Executable (Recommended)
+
+**No Python installation required!**
+
+1. Download `OSINTCOM.exe` from [GitHub Releases](https://github.com/theaustinayers/OSINTCOM/releases)
+2. Run the executable (ignore SmartScreen warning — see below)
+3. Select your audio input and frequency
+4. Click **Start** to begin monitoring
+
+**Note:** First run may show Windows Defender SmartScreen warning (this is normal for unsigned executables). Click "More info" → "Run anyway"
+
+### Option 2: Python Script
+
+**Requirements:** Python 3.8+ 
+
+```bash
+# Clone repository
+git clone https://github.com/theaustinayers/OSINTCOM.git
+cd OSINTCOM
+
+# Create virtual environment
+python -m venv venv
+venv\Scripts\activate  # Windows
+source venv/bin/activate  # Linux/Mac
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run
+python osintcom_qt.py
+```
+
+---
+
+## Quick Start
+
+### 1. Configure Audio Input
+- Click dropdown under **"Audio Interface"**
+- Select your input source:
+  - 🎤 Microphone (direct mic input)
+  - 🔊 Speaker Output / Stereo Mix (loopback for receiver audio)
+  - 📱 USB device (RTL-SDR with audio output, etc.)
+
+### 2. Select Frequency
+- Click one of the **HFGCS frequency buttons** (preset)
+- Or type custom frequency in the frequency field
+
+### 3. Configure Discord (Optional)
+- Click **"Webhooks"** button to open webhook manager
+- Add Discord webhook URL(s) from your server settings
+- Assign nicknames and optional role IDs
+- Enable/disable which webhooks receive uploads
+
+### 4. Adjust Sensitivity
+- Use **Sensitivity slider** (L1-L5)
+  - **L1 (46%):** Ultra-sensitive, catches faint voices, more false positives
+  - **L3 (53%):** Balanced default, recommended for most
+  - **L5 (65%):** Strict, high-confidence only
+- Click **"Calibrate Noise"** to measure environment baseline
+
+### 5. Start Monitoring
+- Click **Start** button
+- Watch the audio meter and ticker display
+- When voice is detected → recording begins + ticker animates
+- Recordings post to Discord automatically
+- Click **Stop** to end monitoring session
+
+---
+
+## Advanced Configuration
+
+### Audio Processing Settings
+1. Click **"Audio Settings"** button
+2. Enable/disable as needed:
+   - **Bandpass Filter**: Removes frequencies outside 300-3000 Hz (SSB optimized)
+   - **Denoise Strength**: 1-10 scale (higher = more aggressive)
+   - **Remove Silent Gaps**: Cuts quiet periods between transmissions
+   - **Voice-Only Extraction**: Toggle + adjust confidence threshold (45-70%)
+
+### Webhook Manager
+1. Click **"Webhooks"** button
+2. **Add Webhook**:
+   - Enter Discord webhook URL
+   - Assign nickname
+   - (Optional) Enter role ID to ping
+   - Enable checkbox
+3. **Update/Remove**: Select webhook from list, edit fields, or delete
+4. Click **OK** to save
+
+### Sensitivity Levels Explained
+| Level | Threshold | Use Case |
+|-------|-----------|----------|
+| L1 | 46% | Ultra-faint voices, weak signals |
+| L2 | 50% | Quiet transmissions |
+| L3 | 53% | **Default**, balanced |
+| L4 | 60% | Clear voices only |
+| L5 | 65% | Voice-only, no borderline signals |
+
+---
+
+## Technical Details
+
+### VAD Confidence Scoring (0-100%)
+- **SNR Gate** (25pt baseline): Filters marginal signals
+- **Pitch Detection** (+0-15): Speech-specific frequency patterns
+- **Entropy** (+0-25): Spectral energy concentration in 500-3500 Hz band
+- **Zero-Crossing Rate** (+0-15): Voice-like pattern analysis
+- **CV Modulation** (+/-5): Natural vs noise-like amplitude variation
+
+### Recording Flow
+```
+┌─ Idle (55% threshold)
+│
+└─→ Voice Detected + SNR > 3dB
+    ├─ Start Recording
+    ├─ Begin 10-second Hangover Timer
+    │
+    └─→ Silence (52% confidence)
+        ├─ Hangover Active
+        ├─ Check: SNR > 4dB AND Confidence > 60%?
+        │  ├─ YES → Reset hangover timer (10s loop)
+        │  └─ NO → Continue countdown
+        │
+        └─→ Hangover Expires OR 10 Silence Frames
+            ├─ Finalize Recording
+            ├─ Validate: voice_duration >= 1.1s?
+            │  ├─ YES → Upload to Discord
+            │  └─ NO → Discard (insufficient voice)
+            │
+            └─→ Ready for next recording
+```
+
+### SNR Gating Prevents False Positives
+- **Recording Start**: Requires SNR > 3.0 dB (filters noise-only bursts)
+- **Hangover Reset**: Requires SNR > 4.0 dB + confidence > 60% (prevents noise tail extension)
+- **Real Voice SNR**: Typically 10-30 dB
+- **Noise Tail SNR**: Typically 0-2 dB (filtered out)
+
+### Periodic Auto-Calibration
+- **Trigger**: Every 5 minutes + not currently recording
+- **Voice Skip**: Skips if voice detected in past 5 minutes (avoids disruption)
+- **Measurement**: Collects 10 seconds of ambient noise
+- **Calculation**: SNR_threshold = measured_noise_snr + 4.0 dB (min 13.0 dB)
+- **CV Adjustment**: Tightens detection if noise variability high (>0.45)
+
+---
+
+## Dependencies
+
+**Required:**
+- numpy >= 1.19
+- scipy >= 1.5
+- PyQt5 >= 5.15
+- sounddevice >= 0.4.5
+- requests >= 2.26
+
+**Optional:**
+- noisereduce >= 2.0 (enhanced noise filtering)
+
+All included in standalone `.exe` executable.
+
+---
+
+## Discord Webhook Setup
+
+### Create a Webhook in Discord
+
+1. Go to your Discord server settings
+2. Navigate to **Integrations** → **Webhooks**
+3. Click **New Webhook**
+4. Give it a name (e.g., "OSINTCOM Monitor")
+5. (#optional) Select a channel
+6. Click **Copy Webhook URL**
+7. Paste into OSINTCOM's Webhook Manager
+
+### Example Webhook URLs
+- ✅ `https://discordapp.com/api/webhooks/999999999/XXXXX...`
+- ✅ `https://discord.com/api/webhooks/999999999/XXXXX...`
+
+---
+
+## File Structure
+
+```
+OSINTCOM/
+├── osintcom_qt.py          # Main application
+├── osintcom.py             # CLI version (alternative)
+├── build_exe.py            # Build script for .exe
+├── requirements.txt        # Python dependencies
+├── ShareTechMono-Regular.ttf  # Ticker font
+├── osintcom_config.json    # User settings (auto-generated)
+├── README.md               # This file
+└── dist/
+    └── OSINTCOM.exe        # Standalone executable
+```
+
+---
+
+## Troubleshooting
+
+### No Audio Input Detected
+- **Solution**: Check Windows Sound settings, enable "Stereo Mix" (for loopback)
+- On some systems: Right-click speaker icon → Recording devices → Enable disabled devices
+
+### Recordings Won't Upload to Discord
+- Verify webhook URL is correct and recent (webhooks expire)
+- Check webhook hasn't been deleted from Discord server
+- Ensure bot permissions allow message sending
+- Check network connectivity
+
+### False Positive Voice Detections
+- Reduce sensitivity (L4 or L5)
+- Click "Calibrate Noise" to retrain baseline
+- Increase voice extraction threshold slider (toward 70%)
+- Enable denoise + bandpass filter
+
+### Missing Audio Data in Recordings
+- Increase **pre-roll duration** (via code modification)
+- Lower sensitivity level (might be missing faint starts)
+- Check that voice duration meets 1.1s minimum
+
+### Font Not Loading
+- Monospace fallback used if ShareTechMono not found
+- Place `ShareTechMono-Regular.ttf` in project folder to enable custom font
+
+---
+
+## Building from Source
+
+### Create Standalone EXE
+
+```bash
+# Install build dependency
+pip install pyinstaller
+
+# Build (creates dist/OSINTCOM.exe)
+python build_exe.py
+```
+
+Output: `dist/OSINTCOM.exe` (~117 MB, includes all dependencies)
+
+---
+
+## Version History
+
+### v1.13 (March 2026)
+- ✨ **Animated alert ticker** with ShareTechMono font
+- ✨ **Multi-webhook manager** with per-webhook role IDs
+- ✨ **Voice extraction confidence slider** (45-70%)
+- 🐛 Fixed numpy.bool_ type error
+- 🔧 SNR gating improvements (>3dB start, >4dB + 60% hangover reset)
+- 🔧 Dynamic threshold scheduling by recording state
+
+### v1.12
+- Periodic auto-calibration every 5 minutes
+- 5-level sensitivity presets (L1-L5)
+- Improved post-roll silence detection
+
+### v1.0
+- Initial VAD implementation
+- Discord webhook integration
+- Audio processing pipeline
+
+---
+
+## License
+
+See [LICENSE](LICENSE) file for details.
+
+---
+
+## Support
+
+- 📖 **Documentation**: See README.md
+- 🐛 **Bug Reports**: Open an issue on GitHub
+- 💬 **Discussions**: GitHub Discussions
+
+---
+
+**Made for HF radio enthusiasts, OSINT researchers, and emergency communications professionals.**
+
 
 ---
 

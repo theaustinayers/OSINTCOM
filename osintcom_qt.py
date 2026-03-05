@@ -30,10 +30,11 @@ except ImportError:
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog, QDialog, QLineEdit,
-    QGroupBox, QStatusBar, QSlider, QTextEdit, QDialogButtonBox, QMessageBox, QCheckBox
+    QGroupBox, QStatusBar, QSlider, QTextEdit, QDialogButtonBox, QMessageBox, QCheckBox,
+    QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QPainter, QColor, QLinearGradient
+from PyQt5.QtGui import QFont, QPainter, QColor, QLinearGradient, QFontDatabase
 
 # ============================================================================
 # Constants
@@ -96,6 +97,7 @@ class WorkerSignals(QObject):
     voice = pyqtSignal(bool)
     status = pyqtSignal(str)
     error = pyqtSignal(str)
+    recording = pyqtSignal(bool)  # True when recording starts, False when stops
 
 # ============================================================================
 # Audio Meter Widget
@@ -133,36 +135,293 @@ class AudioMeter(QWidget):
         painter.end()
 
 # ============================================================================
+# Animated Ticker Widget
+# ============================================================================
+class AnimatedTicker(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(50)
+        self.setMaximumHeight(60)
+        self.setStyleSheet("background-color: #000000; border: 1px solid #333333;")
+        
+        # Load ShareTechMono font
+        self.ticker_font = QFont("Monospace", 20)  # Fallback font
+        try:
+            font_path = os.path.join(os.path.dirname(__file__), "ShareTechMono-Regular.ttf")
+            if os.path.exists(font_path):
+                font_id = QFontDatabase.addApplicationFont(font_path)
+                if font_id >= 0:
+                    families = QFontDatabase.applicationFontFamilies(font_id)
+                    if families:
+                        self.ticker_font = QFont(families[0], 20)
+        except Exception as e:
+            print(f"Warning: Could not load ShareTechMono font: {e}")
+        
+        self._text = "***EAM INCOMING***"
+        self._offset = 0
+        self._is_active = False
+        self._flash_opacity = 1.0
+        self._flash_increasing = False
+        
+        # Timer for animation
+        self.anim_timer = QTimer()
+        self.anim_timer.timeout.connect(self._update_animation)
+        self.anim_timer.setInterval(30)  # ~33 FPS
+    
+    def start_animation(self):
+        """Start the scrolling animation."""
+        self._is_active = True
+        self._offset = 0
+        self._flash_opacity = 1.0
+        self.anim_timer.start()
+    
+    def stop_animation(self):
+        """Stop the scrolling animation."""
+        self._is_active = False
+        self.anim_timer.stop()
+        self._offset = 0
+        self.update()
+    
+    def _update_animation(self):
+        """Update animation state."""
+        if not self._is_active:
+            return
+        
+        # Scroll text
+        self._offset += 3
+        text_width = len(self._text) * 14
+        if self._offset > text_width + self.width():
+            self._offset = -self.width()
+        
+        # Flash effect
+        if self._flash_increasing:
+            self._flash_opacity += 0.05
+            if self._flash_opacity >= 1.0:
+                self._flash_opacity = 1.0
+                self._flash_increasing = False
+        else:
+            self._flash_opacity -= 0.05
+            if self._flash_opacity <= 0.5:
+                self._flash_opacity = 0.5
+                self._flash_increasing = True
+        
+        self.update()
+    
+    def paintEvent(self, event):
+        """Paint the animated ticker."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Draw black background
+        painter.fillRect(self.rect(), QColor(0, 0, 0))
+        
+        if self._is_active:
+            # Draw scrolling text with flash effect
+            painter.setFont(self.ticker_font)
+            
+            # Set color with flash opacity (red with flashing)
+            color = QColor(255, 0, 0)  # Red
+            color.setAlpha(int(255 * self._flash_opacity))
+            painter.setPen(color)
+            
+            # Draw text at offset position (scrolling from right to left)
+            painter.drawText(self._offset, self.height() // 2 + 8, self._text)
+        else:
+            # Idle state - dim text
+            painter.setFont(self.ticker_font)
+            painter.setPen(QColor(64, 64, 64))
+            painter.drawText(10, self.height() // 2 + 8, "READY")
+        
+        painter.end()
+
+# ============================================================================
 # Dialogs
 # ============================================================================
-class WebhookDialog(QDialog):
-    def __init__(self, current_url: str = "", parent=None):
+class WebhookManagerDialog(QDialog):
+    def __init__(self, webhooks: list = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Discord Webhook URL")
-        self.setMinimumWidth(480)
+        self.setWindowTitle("Manage Discord Webhooks")
+        self.setMinimumSize(700, 500)
+        
+        self.webhooks = webhooks or []  # List of {"nickname": str, "url": str, "enabled": bool, "role_id": str}
+        
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Enter your Discord Webhook URL:"))
-        self.url_edit = QLineEdit(current_url)
+        layout.addWidget(QLabel("Manage Discord Webhooks:", font=QFont("Segoe UI", 11, QFont.Bold)))
+        layout.addWidget(QLabel("Enable/disable webhooks and manage destinations for recording uploads"))
+        layout.addSpacing(8)
+        
+        # Webhook list
+        self.list_widget = QListWidget()
+        self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
+        layout.addWidget(QLabel("Configured Webhooks:"))
+        layout.addWidget(self.list_widget)
+        
+        # Edit panel
+        edit_group = QGroupBox("Edit Webhook")
+        edit_layout = QVBoxLayout(edit_group)
+        
+        nickname_layout = QHBoxLayout()
+        nickname_layout.addWidget(QLabel("Nickname:"))
+        self.nickname_edit = QLineEdit()
+        self.nickname_edit.setPlaceholderText("e.g., Main Server, Backup, Archive...")
+        nickname_layout.addWidget(self.nickname_edit)
+        edit_layout.addLayout(nickname_layout)
+        
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("URL:"))
+        self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://discord.com/api/webhooks/...")
-        layout.addWidget(self.url_edit)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def get_url(self) -> str:
-        return self.url_edit.text().strip()
+        url_layout.addWidget(self.url_edit)
+        edit_layout.addLayout(url_layout)
+        
+        role_layout = QHBoxLayout()
+        role_layout.addWidget(QLabel("Role ID (optional):"))
+        self.role_edit = QLineEdit()
+        self.role_edit.setPlaceholderText("e.g., 1474631083042541730 (leave blank to not ping)")
+        role_layout.addWidget(self.role_edit)
+        edit_layout.addLayout(role_layout)
+        
+        self.enabled_chk = QCheckBox("Enabled (will receive uploads)")
+        self.enabled_chk.setChecked(True)
+        edit_layout.addWidget(self.enabled_chk)
+        
+        layout.addWidget(edit_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        add_btn = QPushButton("Add Webhook")
+        add_btn.clicked.connect(self._add_webhook)
+        button_layout.addWidget(add_btn)
+        
+        update_btn = QPushButton("Update Selected")
+        update_btn.clicked.connect(self._update_webhook)
+        button_layout.addWidget(update_btn)
+        
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self._remove_webhook)
+        button_layout.addWidget(remove_btn)
+        layout.addLayout(button_layout)
+        
+        layout.addSpacing(12)
+        dialog_buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        dialog_buttons.accepted.connect(self.accept)
+        dialog_buttons.rejected.connect(self.reject)
+        layout.addWidget(dialog_buttons)
+        
+        self._refresh_list()
+    
+    def _refresh_list(self):
+        """Refresh the webhook list display."""
+        self.list_widget.clear()
+        for i, webhook in enumerate(self.webhooks):
+            status = "✓" if webhook.get("enabled", True) else "✗"
+            nickname = webhook.get("nickname", "Unnamed")
+            url_short = webhook.get("url", "")[-20:] if webhook.get("url") else ""
+            text = f"{status} {nickname} ({url_short})"
+            self.list_widget.addItem(text)
+    
+    def _on_selection_changed(self):
+        """Load selected webhook into edit fields."""
+        current_row = self.list_widget.currentRow()
+        if current_row >= 0 and current_row < len(self.webhooks):
+            webhook = self.webhooks[current_row]
+            self.nickname_edit.setText(webhook.get("nickname", ""))
+            self.url_edit.setText(webhook.get("url", ""))
+            self.role_edit.setText(webhook.get("role_id", ""))
+            self.enabled_chk.setChecked(webhook.get("enabled", True))
+    
+    def _add_webhook(self):
+        """Add a new webhook."""
+        nickname = self.nickname_edit.text().strip()
+        url = self.url_edit.text().strip()
+        role_id = self.role_edit.text().strip()
+        
+        if not nickname:
+            QMessageBox.warning(self, "Missing Nickname", "Please enter a nickname for the webhook")
+            return
+        if not url:
+            QMessageBox.warning(self, "Missing URL", "Please enter a webhook URL")
+            return
+        
+        # Check for duplicates
+        if any(w.get("nickname") == nickname for w in self.webhooks):
+            QMessageBox.warning(self, "Duplicate Nickname", f"A webhook with nickname '{nickname}' already exists")
+            return
+        
+        self.webhooks.append({
+            "nickname": nickname,
+            "url": url,
+            "role_id": role_id,
+            "enabled": self.enabled_chk.isChecked()
+        })
+        
+        self.nickname_edit.clear()
+        self.url_edit.clear()
+        self.role_edit.clear()
+        self.enabled_chk.setChecked(True)
+        self._refresh_list()
+        QMessageBox.information(self, "Success", f"Webhook '{nickname}' added")
+    
+    def _update_webhook(self):
+        """Update selected webhook."""
+        current_row = self.list_widget.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "No Selection", "Please select a webhook to update")
+            return
+        
+        nickname = self.nickname_edit.text().strip()
+        url = self.url_edit.text().strip()
+        role_id = self.role_edit.text().strip()
+        
+        if not nickname:
+            QMessageBox.warning(self, "Missing Nickname", "Please enter a nickname for the webhook")
+            return
+        if not url:
+            QMessageBox.warning(self, "Missing URL", "Please enter a webhook URL")
+            return
+        
+        # Check for duplicate nicknames (excluding current)
+        for i, w in enumerate(self.webhooks):
+            if i != current_row and w.get("nickname") == nickname:
+                QMessageBox.warning(self, "Duplicate Nickname", f"A webhook with nickname '{nickname}' already exists")
+                return
+        
+        self.webhooks[current_row] = {
+            "nickname": nickname,
+            "url": url,
+            "role_id": role_id,
+            "enabled": self.enabled_chk.isChecked()
+        }
+        
+        self._refresh_list()
+        QMessageBox.information(self, "Success", f"Webhook '{nickname}' updated")
+    
+    def _remove_webhook(self):
+        """Remove selected webhook."""
+        current_row = self.list_widget.currentRow()
+        if current_row < 0:
+            QMessageBox.warning(self, "No Selection", "Please select a webhook to remove")
+            return
+        
+        nickname = self.webhooks[current_row].get("nickname", "Unnamed")
+        confirm = QMessageBox.question(self, "Confirm Removal", 
+                                      f"Remove webhook '{nickname}'?",
+                                      QMessageBox.Yes | QMessageBox.No)
+        if confirm == QMessageBox.Yes:
+            self.webhooks.pop(current_row)
+            self.nickname_edit.clear()
+            self.url_edit.clear()
+            self._refresh_list()
+    
+    def get_webhooks(self) -> list:
+        return self.webhooks
 
 class WebhookCustomizeDialog(QDialog):
-    def __init__(self, role_id: str = "", message_template: str = "", parent=None):
+    def __init__(self, message_template: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Customize Webhook Message")
         self.setMinimumWidth(520)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Role ID to ping (leave blank for none):"))
-        self.role_edit = QLineEdit(role_id)
-        self.role_edit.setPlaceholderText("e.g. 1474631083042541730")
-        layout.addWidget(self.role_edit)
         layout.addWidget(QLabel("Message text:"))
         self.msg_edit = QTextEdit()
         self.msg_edit.setPlainText(message_template or "EMERGENCY ACTION MESSAGE INCOMING")
@@ -173,7 +432,6 @@ class WebhookCustomizeDialog(QDialog):
         self.preview_label.setWordWrap(True)
         self.preview_label.setStyleSheet("color: #a6adc8; padding: 6px; background: #313244; border-radius: 4px;")
         layout.addWidget(self.preview_label)
-        self.role_edit.textChanged.connect(self._update_preview)
         self.msg_edit.textChanged.connect(self._update_preview)
         self._update_preview()
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -182,14 +440,9 @@ class WebhookCustomizeDialog(QDialog):
         layout.addWidget(buttons)
 
     def _update_preview(self, *_):
-        role = self.role_edit.text().strip()
         msg = self.msg_edit.toPlainText().strip() or "EMERGENCY ACTION MESSAGE INCOMING"
-        role_part = f"@Role({role}) " if role else ""
         freq = "8992 kHz"
-        self.preview_label.setText(f"{role_part}{msg}\n─ {freq} | {datetime.datetime.utcnow().isoformat()}Z")
-
-    def get_role_id(self) -> str:
-        return self.role_edit.text().strip()
+        self.preview_label.setText(f"{msg}\n─ {freq} | {datetime.datetime.utcnow().isoformat()}Z")
 
     def get_message_template(self) -> str:
         return self.msg_edit.toPlainText().strip()
@@ -248,8 +501,23 @@ class AudioSettingsDialog(QDialog):
         self.voice_extract_chk.setToolTip("Send only clear voice segments, remove all background")
         layout.addWidget(self.voice_extract_chk)
         
+        # Voice extraction confidence threshold slider
+        extract_threshold_layout = QHBoxLayout()
+        extract_threshold_layout.addWidget(QLabel("Voice Extraction Confidence Threshold:"))
+        self.voice_extract_threshold = QSlider(Qt.Horizontal)
+        self.voice_extract_threshold.setMinimum(45)
+        self.voice_extract_threshold.setMaximum(70)
+        self.voice_extract_threshold.setValue(self.settings.get("voice_extract_threshold", 58))
+        self.voice_extract_threshold.setTickPosition(QSlider.TicksBelow)
+        self.voice_extract_threshold.setTickInterval(1)
+        extract_threshold_layout.addWidget(self.voice_extract_threshold)
+        self.extract_threshold_label = QLabel(str(self.settings.get("voice_extract_threshold", 58)) + "%")
+        extract_threshold_layout.addWidget(self.extract_threshold_label)
+        self.voice_extract_threshold.valueChanged.connect(lambda v: self.extract_threshold_label.setText(str(v) + "%"))
+        layout.addLayout(extract_threshold_layout)
+        
         layout.addSpacing(12)
-        layout.addWidget(QLabel("ℹ️ Voice-Only mode sends cleanest audio but may cut very quiet voices.", 
+        layout.addWidget(QLabel("ℹ️ Voice-Only mode sends cleanest audio but may cut very quiet voices. Lower threshold = include more borderline segments.", 
                                font=QFont("Segoe UI", 9)))
         
         layout.addStretch()
@@ -266,6 +534,7 @@ class AudioSettingsDialog(QDialog):
             "denoise_strength": self.denoise_strength.value(),
             "remove_silence": self.remove_silence_chk.isChecked(),
             "voice_extract": self.voice_extract_chk.isChecked(),
+            "voice_extract_threshold": self.voice_extract_threshold.value(),
         }
 
 # ============================================================================
@@ -301,8 +570,7 @@ class OSINTCOMWindow(QMainWindow):
         self._silence_timer_remaining = 0
         self._sensitivity_level = 3
         self._previous_energy_db = -60.0  # Track energy for drop-off detection
-        self._webhook_url = ""
-        self._webhook_role_id = ""
+        self._webhooks = []  # List of {"nickname": str, "url": str, "enabled": bool, "role_id": str}
         self._webhook_message = "EMERGENCY ACTION MESSAGE INCOMING"
         self._frequency = ""
         self._save_dir = os.path.join(os.path.expanduser("~"), "Documents", "OSINTCOM")
@@ -355,6 +623,7 @@ class OSINTCOMWindow(QMainWindow):
             "denoise_strength": 6,
             "remove_silence": False,
             "voice_extract": False,
+            "voice_extract_threshold": 58,
         }
         
         os.makedirs(self._save_dir, exist_ok=True)
@@ -457,10 +726,14 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.12")
+        version_label = QLabel("v1.13")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
+        
+        # Animated Ticker Display
+        self.ticker = AnimatedTicker()
+        layout.addWidget(self.ticker)
 
         # HFGCS Frequencies
         self.hfgcs_frequencies = [4724.0, 6739.0, 8992.0, 11175.0, 13200.0, 15016.0, 18046.0]
@@ -524,7 +797,7 @@ class OSINTCOMWindow(QMainWindow):
         self.webhook_edit = QLineEdit()
         self.webhook_edit.setPlaceholderText("Webhook URL")
         webhook_row.addWidget(self.webhook_edit)
-        webhook_btn = QPushButton("Webhook")
+        webhook_btn = QPushButton("Webhooks")
         webhook_btn.clicked.connect(self._open_webhook_dialog)
         webhook_row.addWidget(webhook_btn)
         discord_layout.addLayout(webhook_row)
@@ -574,6 +847,7 @@ class OSINTCOMWindow(QMainWindow):
         self._signals.voice.connect(self._on_voice)
         self._signals.status.connect(self._on_status)
         self._signals.error.connect(self._on_error)
+        self._signals.recording.connect(self._on_recording)
 
     def _init_timer(self):
         self._meter_timer = QTimer(self)
@@ -627,17 +901,22 @@ class OSINTCOMWindow(QMainWindow):
         self.sens_label.setText(SENSITIVITY_LABELS[value])
 
     def _open_webhook_dialog(self):
-        dlg = WebhookDialog(self._webhook_url, self)
+        dlg = WebhookManagerDialog(self._webhooks, self)
         if dlg.exec_() == QDialog.Accepted:
-            self._webhook_url = dlg.get_url()
-            self.webhook_edit.setText("✓ Webhook configured (" + self._webhook_url[-20:] + ")")
+            self._webhooks = dlg.get_webhooks()
+            # Update display
+            enabled_count = sum(1 for w in self._webhooks if w.get("enabled", True))
+            total_count = len(self._webhooks)
+            if total_count > 0:
+                self.webhook_edit.setText(f"✓ {enabled_count}/{total_count} webhooks active")
+            else:
+                self.webhook_edit.setText("No webhooks configured")
             self.webhook_edit.setReadOnly(True)
-            self._save_config()  # Auto-save webhook
+            self._save_config()  # Auto-save webhooks
 
     def _open_customize_dialog(self):
-        dlg = WebhookCustomizeDialog(self._webhook_role_id, self._webhook_message, self)
+        dlg = WebhookCustomizeDialog(self._webhook_message, self)
         if dlg.exec_() == QDialog.Accepted:
-            self._webhook_role_id = dlg.get_role_id()
             self._webhook_message = dlg.get_message_template()
             self.message_edit.setText(self._webhook_message[:40] + "..." if len(self._webhook_message) > 40 else self._webhook_message)
             self._save_config()  # Auto-save customize
@@ -657,8 +936,8 @@ class OSINTCOMWindow(QMainWindow):
         if not self._frequency:
             QMessageBox.warning(self, "Warning", "Please select a frequency first.")
             return
-        if not self._webhook_url:
-            QMessageBox.warning(self, "Warning", "Please configure Discord webhook first.")
+        if not self._webhooks:
+            QMessageBox.warning(self, "Warning", "Please configure Discord webhooks first.")
             return
         self._running = True
         self._learning_phase = "startup"  # Start with initial learning
@@ -1734,14 +2013,17 @@ class OSINTCOMWindow(QMainWindow):
             chunk_size = BLOCK_SIZE
             voice_audio = np.zeros_like(audio)
             
+            # Get voice extraction threshold from settings (default 58%)
+            threshold = self._audio_settings.get("voice_extract_threshold", 58)
+            
             for i in range(0, len(audio), chunk_size):
                 end = min(i + chunk_size, len(audio))
                 chunk = audio[i:end]
                 
-                # Use VAD to detect if this chunk is voice (score > 58 = voice territory, less aggressive)
-                # Lowered from 65 to preserve more voice while filtering noise (98% good)
+                # Use VAD to detect if this chunk is voice
+                # Threshold adjustable via Audio Processing Settings
                 score = self._detect_voice(chunk)
-                if score > 58:  # 58+ = voice extraction (minimal aggressiveness)
+                if score > threshold:  # User-adjustable threshold for voice extraction
                     voice_audio[i:end] = chunk
             
             return voice_audio
@@ -2010,11 +2292,13 @@ class OSINTCOMWindow(QMainWindow):
         self._signals.status.emit(
             f"Recording... | VAD: Voice | Pre-roll: {len(self._audio_buffer) * BLOCK_SIZE / self._sample_rate:.1f}s"
         )
+        self._signals.recording.emit(True)  # Trigger animation start
 
     def _finalize_recording(self):
         self._recording = False
         self._voice_started_at = None
         self._voice_silence_at = None
+        self._signals.recording.emit(False)  # Stop animation
         
         # Clear hangover flag for next recording cycle
         if hasattr(self, '_hangover_started'):
@@ -2067,33 +2351,41 @@ class OSINTCOMWindow(QMainWindow):
             wav.write(filepath, self._sample_rate, (audio_data * 32767).astype(np.int16))
             self._signals.status.emit(f"Saved: {os.path.basename(filepath)}")
             
-            # Upload to Discord
-            if self._webhook_url:
+            # Upload to Discord (all enabled webhooks)
+            enabled_webhooks = [w for w in self._webhooks if w.get("enabled", True)]
+            if enabled_webhooks:
                 self._upload_to_discord(filepath)
-                self._signals.status.emit(f"Uploaded | Frequency: {self._frequency}")
+                self._signals.status.emit(f"Uploaded to {len(enabled_webhooks)} webhook(s) | Frequency: {self._frequency}")
         except Exception as e:
             self._signals.error.emit(f"Encoding/upload failed: {e}")
 
     def _upload_to_discord(self, filepath: str):
         try:
-            with open(filepath, 'rb') as f:
-                # Use file1 as the field name for the attachment
-                files = {'file1': (os.path.basename(filepath), f)}
-                role_part = f"<@&{self._webhook_role_id}>" if self._webhook_role_id else ""
-                
-                # Discord webhook requires JSON to be sent as payload_json parameter
-                payload = {
-                    'content': f"{role_part} {self._webhook_message}",
-                    'embeds': [{
-                        'title': f"{self._frequency} kHz",
-                        'color': 3066993,
-                        'timestamp': datetime.datetime.utcnow().isoformat()
-                    }]
-                }
-                
-                # Send as multipart form-data with payload_json
-                data = {'payload_json': json.dumps(payload)}
-                requests.post(self._webhook_url, data=data, files=files, timeout=30)
+            # Send to all enabled webhooks
+            for webhook in self._webhooks:
+                if webhook.get("enabled", True):
+                    try:
+                        # Build payload with webhook-specific role_id
+                        role_id = webhook.get("role_id", "")
+                        role_part = f"<@&{role_id}>" if role_id else ""
+                        
+                        payload = {
+                            'content': f"{role_part} {self._webhook_message}",
+                            'embeds': [{
+                                'title': f"{self._frequency} kHz",
+                                'color': 3066993,
+                                'timestamp': datetime.datetime.utcnow().isoformat()
+                            }]
+                        }
+                        
+                        with open(filepath, 'rb') as f:
+                            files = {'file1': (os.path.basename(filepath), f)}
+                            data = {'payload_json': json.dumps(payload)}
+                            requests.post(webhook.get("url"), data=data, files=files, timeout=30)
+                    except Exception as e:
+                        nickname = webhook.get("nickname", "Unknown")
+                        if self._meter_debug:
+                            print(f"Failed to upload to '{nickname}': {e}")
         except Exception as e:
             self._signals.error.emit(f"Discord upload failed: {e}")
 
@@ -2108,6 +2400,13 @@ class OSINTCOMWindow(QMainWindow):
             self.voice_label.setText("static")
             self.voice_label.setStyleSheet("color: red; font-weight: bold; font-size: 12px;")
 
+    def _on_recording(self, is_recording):
+        """Handle recording state change - control ticker animation."""
+        if is_recording:
+            self.ticker.start_animation()
+        else:
+            self.ticker.stop_animation()
+
     def _on_status(self, msg):
         self.status_bar.showMessage(msg)
 
@@ -2120,9 +2419,8 @@ class OSINTCOMWindow(QMainWindow):
             "device": self.device_combo.currentText(),
             "sensitivity": self.sens_slider.value(),
             "frequency": self.freq_display.text(),
-            "webhook_url": self.webhook_edit.text(),
+            "webhooks": self._webhooks,
             "custom_message": self.message_edit.text(),
-            "role_id": self._webhook_role_id,
             "file_location": self._save_dir,
             "audio_settings": self._audio_settings
         }
@@ -2154,17 +2452,29 @@ class OSINTCOMWindow(QMainWindow):
                     self.freq_display.setText(config["frequency"])
                     self._frequency = config["frequency"].split()[0]  # Extract just the number
                 
-                if "webhook_url" in config:
-                    self.webhook_edit.setText("✓ Webhook configured (" + config["webhook_url"][-20:] + ")")
+                # Load webhooks (new format) or convert from old format
+                if "webhooks" in config:
+                    self._webhooks = config["webhooks"]
+                    enabled_count = sum(1 for w in self._webhooks if w.get("enabled", True))
+                    total_count = len(self._webhooks)
+                    if total_count > 0:
+                        self.webhook_edit.setText(f"✓ {enabled_count}/{total_count} webhooks active")
                     self.webhook_edit.setReadOnly(True)
-                    self._webhook_url = config["webhook_url"]
+                elif "webhook_url" in config and config["webhook_url"]:  # Backwards compatibility
+                    old_url = config["webhook_url"]
+                    if old_url.startswith("✓"):
+                        old_url = old_url.split("(")[1].rstrip(")")
+                    self._webhooks = [{
+                        "nickname": "Legacy Webhook",
+                        "url": old_url,
+                        "enabled": True
+                    }]
+                    self.webhook_edit.setText("✓ 1/1 webhooks active")
+                    self.webhook_edit.setReadOnly(True)
                 
                 if "custom_message" in config:
                     self.message_edit.setText(config["custom_message"])
                     self._webhook_message = config["custom_message"]
-                
-                if "role_id" in config:
-                    self._webhook_role_id = config["role_id"]
                 
                 if "file_location" in config:
                     self._save_dir = config["file_location"]
