@@ -874,23 +874,27 @@ class OSINTCOMWindow(QMainWindow):
                 snr_percentile = snr_db
             
             # ===== LAYER 1: SNR GATE =====
-            # Determine thresholds based on state
+            # Determine thresholds based on state (lowered for weak radio signals)
             if self._recording:
-                snr_threshold = 0.0
+                snr_threshold = -2.0  # Very lenient during recording
             elif self._hangover_remaining > 0:
-                snr_threshold = 2.0
+                snr_threshold = 0.0  # Hang over is lenient
             else:
-                snr_threshold = 6.0
+                snr_threshold = 3.0  # Lowered from 6 - radio signals are weak
             
             snr_passes = snr_percentile > snr_threshold
             
             # Layer 1 score: 0-25 points (gate + bonus)
             if not snr_passes:
                 confidence = 0.0  # SNR gate fails - everything fails
+                if debug:
+                    print(f"  [FAILED SNR Gate] {snr_percentile:.1f}dB < {snr_threshold:.1f}dB threshold")
             else:
                 confidence = 20.0  # Base score for passing SNR
                 if snr_percentile > snr_threshold + 3.0:
                     confidence = 25.0  # Bonus for strong SNR
+                if debug:
+                    print(f"  [PASSED SNR Gate] {snr_percentile:.1f}dB >= {snr_threshold:.1f}dB (score: {confidence:.0f})")
             
             # ===== LAYER 2: PITCH DETECTION =====
             # Voice fundamental ~85-250Hz (can reach 300Hz for children/women high)
@@ -993,16 +997,17 @@ class OSINTCOMWindow(QMainWindow):
             peak_idx = np.argmax(autocorr_pitch) if len(autocorr_pitch) > 0 else 0
             peak_strength = autocorr_pitch[peak_idx] if len(autocorr_pitch) > 0 else 0.0
             
-            # Voice: peak_strength > 0.6, Static: < 0.3
-            # Map: <0.3 = 0 pts, >0.6 = 25 pts, linear between
-            if peak_strength > 0.60:
+            # Lowered thresholds for weak radio voice
+            # Voice: peak_strength > 0.45, Static: < 0.20
+            # Map: <0.20 = 0 pts, >0.45 = 25 pts, linear between
+            if peak_strength > 0.45:
                 return 25.0
-            elif peak_strength < 0.30:
+            elif peak_strength < 0.20:
                 return 0.0
             else:
-                return (peak_strength - 0.30) / 0.30 * 25.0
+                return (peak_strength - 0.20) / 0.25 * 25.0
         except:
-            return 0.0
+            return 2.0  # Small credit for attempting pitch detection
     
     def _estimate_spectral_entropy(self, audio: np.ndarray) -> float:
         """Estimate spectral entropy - low for voice, high for static.
@@ -1035,16 +1040,17 @@ class OSINTCOMWindow(QMainWindow):
             max_entropy = np.log(len(power))
             normalized_entropy = entropy / (max_entropy + 1e-10)
             
+            # Lowered thresholds for radio speech
             # Voice: entropy ~0.3-0.5, Static: entropy ~0.7-0.9
-            # Map: >0.7 = 0 pts (chaotic), <0.5 = 25 pts (organized), linear between
-            if normalized_entropy > 0.70:
+            # Map: >0.65 = 0 pts (chaotic), <0.45 = 25 pts (organized), linear between
+            if normalized_entropy > 0.65:
                 return 0.0
-            elif normalized_entropy < 0.50:
+            elif normalized_entropy < 0.45:
                 return 25.0
             else:
-                return (0.70 - normalized_entropy) / 0.20 * 25.0
+                return (0.65 - normalized_entropy) / 0.20 * 25.0
         except:
-            return 0.0
+            return 2.0  # Small credit for attempting entropy check
     
     def _zero_crossing_rate_score(self, audio: np.ndarray) -> float:
         """Calculate zero-crossing rate - low for voice, high for static.
@@ -1062,16 +1068,17 @@ class OSINTCOMWindow(QMainWindow):
             zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_work)))) / 2.0
             zcr = zero_crossings / len(audio_work)
             
+            # Lowered thresholds for weak radio voice
             # Voice: ZCR ~0.08-0.15, Static: ZCR >0.25
-            # Map: >0.25 = 0 pts, <0.15 = 25 pts, linear between
-            if zcr > 0.25:
+            # Map: >0.30 = 0 pts, <0.10 = 25 pts, linear between (more lenient)
+            if zcr > 0.30:
                 return 0.0
-            elif zcr < 0.15:
+            elif zcr < 0.10:
                 return 25.0
             else:
-                return (0.25 - zcr) / 0.10 * 25.0
+                return (0.30 - zcr) / 0.20 * 25.0
         except:
-            return 0.0
+            return 2.0  # Small credit for attempting ZCR check
     
     def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
         """Check for speech-like modulation at 3-8 Hz (syllabic rate).
@@ -1647,7 +1654,7 @@ class OSINTCOMWindow(QMainWindow):
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
             # v1.08.3: Requires 3.5+ seconds of sustained high confidence to prevent false positives
             # Voice confidence accumulator
-            if confidence > 60:
+            if confidence > 45:  # Lowered from 60 for weak radio signals
                 # Accumulate high-confidence time
                 if self._last_high_confidence_time is None:
                     self._last_high_confidence_time = time.time()
