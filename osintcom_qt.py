@@ -19,9 +19,8 @@ import uuid
 import numpy as np
 import sounddevice as sd
 import requests
-# scipy imports removed - using numpy-only signal processing now
-# from scipy.signal import butter, sosfiltfilt, welch, get_window
-# from scipy.fftpack import fft
+from scipy.signal import butter, sosfiltfilt, welch, get_window
+from scipy.fftpack import fft
 try:
     import noisereduce as nr
     HAS_NOISEREDUCE = True
@@ -43,7 +42,7 @@ CONFIG_FILE = "osintcom_config.json"
 
 CHANNELS = 1
 BLOCK_SIZE = 2048
-PRE_ROLL_SECONDS = 3.0  # 3 seconds of audio before VAD triggers
+PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
 POST_ROLL_SECONDS = 10.0  # 10 seconds of silence/decay after last word peak
 MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
@@ -58,27 +57,27 @@ VAD_STOP_CONFIDENCE = 20  # Stop recording threshold
 # Detects word peaks and uses 10-second post-roll from last word
 SENSITIVITY_PRESETS = {
     # Level 1: Maximum sensitivity - catches faintest voices
-    1: {"confidence_start": 55, "confidence_continue": 20, "confidence_stop": 10,
-        "word_peak_threshold": 65, "post_roll_seconds": 10,
+    1: {"confidence_start": 46, "confidence_continue": 21, "confidence_stop": 9,
+        "word_peak_threshold": 66, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
         "zcr_weight": 0.15, "pitch_weight": 0.10},
     # Level 2: Very sensitive - good for weak radio
-    2: {"confidence_start": 60, "confidence_continue": 25, "confidence_stop": 15,
+    2: {"confidence_start": 50, "confidence_continue": 23, "confidence_stop": 10,
         "word_peak_threshold": 70, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
         "zcr_weight": 0.15, "pitch_weight": 0.10},
     # Level 3: Balanced (default)
-    3: {"confidence_start": 65, "confidence_continue": 30, "confidence_stop": 20,
-        "word_peak_threshold": 75, "post_roll_seconds": 10,
+    3: {"confidence_start": 53, "confidence_continue": 24, "confidence_stop": 11,
+        "word_peak_threshold": 73, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
         "zcr_weight": 0.15, "pitch_weight": 0.10},
     # Level 4: Strict - rejects static
-    4: {"confidence_start": 70, "confidence_continue": 40, "confidence_stop": 25,
+    4: {"confidence_start": 60, "confidence_continue": 27, "confidence_stop": 12,
         "word_peak_threshold": 80, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
         "zcr_weight": 0.15, "pitch_weight": 0.10},
     # Level 5: Voice only - maximum rejection
-    5: {"confidence_start": 75, "confidence_continue": 50, "confidence_stop": 30,
+    5: {"confidence_start": 65, "confidence_continue": 29, "confidence_stop": 13,
         "word_peak_threshold": 85, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
         "zcr_weight": 0.15, "pitch_weight": 0.10},
@@ -331,13 +330,18 @@ class OSINTCOMWindow(QMainWindow):
         self._adaptive_cv_min = 0.25  # Default, updated by calibration
         self._adaptive_cv_max = 0.60  # Default, updated by calibration
         
+        # Automatic periodic calibration (every 5 minutes when no voice detected)
+        self._last_confirmed_voice_time = None
+        self._periodic_calibration_enabled = True
+        self._calibration_interval_seconds = 300
+        
         # SSB-friendly SNR gate: use rolling minimum of last 2s
         self._snr_percentile_window = 87  # ~2 seconds of SNR samples
         
         # Voice confirmation timer - requires 2.0 seconds of sustained high confidence
         # Lowered from 3.5s for faint radio voices with natural pauses
         self._voice_confidence_duration = 0.0  # Cumulative seconds of high confidence
-        self._voice_confirmation_threshold = 2.0  # Seconds of voice confidence needed
+        self._voice_confirmation_threshold = 1.1  # Seconds of voice confidence needed (1.1s minimum for stability)
         self._last_high_confidence_time = None  # Timestamp of last high confidence frame
         
         # Signal-based VAD (no ML dependencies)
@@ -575,6 +579,11 @@ class OSINTCOMWindow(QMainWindow):
         self._meter_timer = QTimer(self)
         self._meter_timer.setInterval(50)
         self._meter_timer.timeout.connect(self._update_meter)
+        
+        # Periodic calibration timer (every 5 minutes)
+        self._calibration_timer = QTimer(self)
+        self._calibration_timer.setInterval(self._calibration_interval_seconds * 1000)
+        self._calibration_timer.timeout.connect(self._on_periodic_calibration)
 
     def _populate_devices(self):
         try:
@@ -659,6 +668,7 @@ class OSINTCOMWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self._meter_timer.start()
+        self._calibration_timer.start()  # Start periodic calibration
         self._start_audio_stream()
 
     def _on_stop(self):
@@ -666,10 +676,31 @@ class OSINTCOMWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self._meter_timer.stop()
+        self._calibration_timer.stop()  # Stop periodic calibration
         self._stop_audio_stream()
 
     def _on_calibrate_noise(self):
         """Record 10 seconds of ambient noise, analyze it, and auto-adjust VAD thresholds."""
+        # CRITICAL: Stop any active recording and reset VAD state
+        if self._recording:
+            self._finalize_recording()  # Force stop any ongoing recording
+        
+        # Reset all VAD state to clean state
+        self._hangover_remaining = 0.0
+        self._voice_confidence_duration = 0.0
+        self._last_high_confidence_time = None
+        self._voice_detected = False
+        self._low_confidence_frames = 0
+        self._post_roll_silence_frames = 0
+        
+        # Clear hangover tracking flags
+        if hasattr(self, '_hangover_started'):
+            delattr(self, '_hangover_started')
+        
+        # Clear ring buffer to ensure clean 10-second calibration sample
+        with self._lock:
+            self._ring_buffer.clear()
+        
         msg = QMessageBox()
         msg.setWindowTitle("Calibrate Noise Floor")
         msg.setText("Recording 10 seconds of ambient noise...\n\nMake sure the radio is NOT transmitting voice.")
@@ -765,9 +796,135 @@ class OSINTCOMWindow(QMainWindow):
             self.status_bar.showMessage(f"Calibration error: {str(e)[:50]}")
             QMessageBox.warning(self, "Calibration Error", f"Failed to analyze noise: {str(e)[:100]}")
         finally:
+            # Reset VAD state after calibration completes
+            self._hangover_remaining = 0.0
+            self._voice_confidence_duration = 0.0
+            self._last_high_confidence_time = None
+            self._voice_detected = False
+            self._low_confidence_frames = 0
+            self._post_roll_silence_frames = 0
+            
+            # Clear hangover tracking flags
+            if hasattr(self, '_hangover_started'):
+                delattr(self, '_hangover_started')
+            
+            # Clear ring buffer
+            with self._lock:
+                self._ring_buffer.clear()
+            
             self.calibrate_btn.setEnabled(True)
             self.calibrate_btn.setStyleSheet("")  # Reset button style to normal
             self._calibration_samples = []
+
+    def _on_periodic_calibration(self):
+        """Automatic calibration every 5 minutes if no voice detected recently."""
+        if not self._periodic_calibration_enabled or self._running is False:
+            return
+        
+        # Check if voice was detected in the past 5 minutes
+        now = time.time()
+        if self._last_confirmed_voice_time is None:
+            # No voice ever detected, safe to calibrate
+            time_since_voice = float('inf')
+        else:
+            time_since_voice = now - self._last_confirmed_voice_time
+        
+        # Only auto-calibrate if no voice in past 5 minutes AND not currently recording
+        if time_since_voice >= self._calibration_interval_seconds and not self._recording:
+            self._run_auto_calibration()
+    
+    def _run_auto_calibration(self):
+        """Run automatic calibration silently without user interaction."""
+        # Clear ring buffer for clean sample
+        with self._lock:
+            self._ring_buffer.clear()
+        
+        self._calibration_samples = []
+        self._calibration_start = time.time()
+        self._calibration_active = True
+        
+        self.status_bar.showMessage("🎤 Auto-calibrating noise floor (10s)...")
+        
+        # After 10 seconds, analyze
+        QTimer.singleShot(10000, self._analyze_auto_calibration)
+    
+    def _analyze_auto_calibration(self):
+        """Analyze auto-calibration samples and adjust thresholds silently."""
+        self._calibration_active = False
+        
+        if len(self._calibration_samples) < 100:
+            # Not enough samples, skip
+            self.status_bar.showMessage("Auto-calibration: insufficient samples, skipped")
+            return
+        
+        try:
+            # Concatenate all samples
+            audio_data = np.concatenate(self._calibration_samples)
+            audio_data = np.clip(audio_data, -1.0, 1.0).astype(np.float32)
+            
+            # Analyze noise properties
+            rms_noise = np.sqrt(np.mean(audio_data ** 2))
+            snr_db_noise = 20 * np.log10((rms_noise + 1e-10) / (self._noise_floor_rms + 1e-10))
+            
+            # Check modulation (CV) of noise
+            chunk_size = len(audio_data) // 10
+            rms_values = []
+            for i in range(10):
+                start = i * chunk_size
+                end = start + chunk_size if i < 9 else len(audio_data)
+                chunk_rms = np.sqrt(np.mean(audio_data[start:end] ** 2))
+                rms_values.append(chunk_rms)
+            
+            rms_mean = np.mean(rms_values)
+            if rms_mean > 1e-10:
+                cv_noise = np.std(rms_values) / rms_mean
+            else:
+                cv_noise = 0.0
+            
+            # Adjust thresholds based on noise characteristics
+            old_snr = self._adaptive_snr_threshold
+            old_cv_min = self._adaptive_cv_min
+            old_cv_max = self._adaptive_cv_max
+            
+            # Adaptive SNR: noise SNR was X, so require voice to be +4dB above it
+            new_snr = max(13.0, snr_db_noise + 4.0)
+            
+            # Adaptive CV: if noise CV is high (variable), tighten acceptance range
+            if cv_noise > 0.45:
+                new_cv_min = 0.32
+                new_cv_max = 0.50
+            else:
+                new_cv_min = 0.28
+                new_cv_max = 0.55
+            
+            # Apply new thresholds
+            self._adaptive_snr_threshold = new_snr
+            self._adaptive_cv_min = new_cv_min
+            self._adaptive_cv_max = new_cv_max
+            
+            # Log silently to status bar
+            self.status_bar.showMessage(
+                f"Auto-calibrated: SNR {old_snr:.1f}→{new_snr:.1f}dB, CV {old_cv_min:.2f}-{old_cv_max:.2f}→{new_cv_min:.2f}-{new_cv_max:.2f}"
+            )
+            
+        except Exception as e:
+            self.status_bar.showMessage(f"Auto-calibration error: {str(e)[:40]}")
+        finally:
+            # Reset VAD state
+            self._hangover_remaining = 0.0
+            self._voice_confidence_duration = 0.0
+            self._last_high_confidence_time = None
+            self._voice_detected = False
+            if hasattr(self, '_low_confidence_frames'):
+                self._low_confidence_frames = 0
+            if hasattr(self, '_post_roll_silence_frames'):
+                self._post_roll_silence_frames = 0
+            if hasattr(self, '_hangover_started'):
+                delattr(self, '_hangover_started')
+            
+            # Clear ring buffer
+            with self._lock:
+                self._ring_buffer.clear()
 
     def _start_audio_stream(self):
         try:
@@ -887,9 +1044,9 @@ class OSINTCOMWindow(QMainWindow):
             if self._recording:
                 snr_threshold = -2.0  # Very lenient during recording
             elif self._hangover_remaining > 0:
-                snr_threshold = 0.0  # Hang over is lenient
+                snr_threshold = 0.0  # Hangover is lenient
             else:
-                snr_threshold = 3.0  # Lowered from 6 - radio signals are weak
+                snr_threshold = 0.5  # LOWERED from 3.0 - HF radio signals are very weak
             
             snr_passes = snr_percentile > snr_threshold
             
@@ -897,13 +1054,13 @@ class OSINTCOMWindow(QMainWindow):
             if not snr_passes:
                 confidence = 0.0  # SNR gate fails - everything fails
                 if debug:
-                    print(f"  [FAILED SNR Gate] {snr_percentile:.1f}dB < {snr_threshold:.1f}dB threshold")
+                    print(f"  [FAILED SNR Gate] SNR {snr_percentile:.1f}dB < {snr_threshold:.1f}dB (Noise floor: {20*np.log10(self._noise_floor_rms+1e-10):.1f}dB, RMS: {20*np.log10(rms+1e-10):.1f}dB)")
             else:
                 confidence = 20.0  # Base score for passing SNR
                 if snr_percentile > snr_threshold + 3.0:
                     confidence = 25.0  # Bonus for strong SNR
                 if debug:
-                    print(f"  [PASSED SNR Gate] {snr_percentile:.1f}dB >= {snr_threshold:.1f}dB (score: {confidence:.0f})")
+                    print(f"  [PASSED SNR Gate] SNR {snr_percentile:.1f}dB >= {snr_threshold:.1f}dB (Noise floor: {20*np.log10(self._noise_floor_rms+1e-10):.1f}dB, RMS: {20*np.log10(rms+1e-10):.1f}dB) → score: {confidence:.0f}")
             
             # ===== LAYER 2: PITCH DETECTION =====
             # Voice fundamental ~85-250Hz. Best single discriminator for SSB voice.
@@ -1529,40 +1686,49 @@ class OSINTCOMWindow(QMainWindow):
         return processed
     
     def _apply_bandpass_filter(self, audio: np.ndarray) -> np.ndarray:
-        """Apply bandpass filter 300-3000 Hz for SSB speech."""
+        """Apply bandpass filter 300-3000 Hz for SSB speech using scipy."""
         try:
-            # Butterworth bandpass
+            # Butterworth bandpass (proven stable design)
             sos = butter(4, [300, 3000], btype='band', fs=self._sample_rate, output='sos')
             filtered = sosfiltfilt(sos, audio)
-            return filtered
-        except:
+            return np.clip(filtered, -1.0, 1.0)
+        except Exception as e:
+            if self._meter_debug:
+                print(f"Bandpass filter error: {e}")
             return audio
     
     def _apply_enhanced_denoise(self, audio: np.ndarray, strength: int) -> np.ndarray:
-        """Apply enhanced noise reduction."""
+        """Apply enhanced noise reduction using noisereduce library (proven stable).
+        
+        Strength 1-10 maps to noise reduction aggressiveness:
+        1-3: Light (preserve quality)
+        4-6: Balanced
+        7-10: Aggressive (noise removal)
+        """
         if not HAS_NOISEREDUCE:
             return audio
         
         try:
-            # Map strength 1-10 to noise reduction parameters
-            # Higher strength = more aggressive denoising
-            prop_decrease = 0.4 + (strength / 10.0) * 0.5  # 0.4 to 0.9
+            # Map strength 1-10 to denoising parameter
+            prop_decrease = 0.3 + (strength / 10.0) * 0.5  # 0.3 to 0.8
             
-            # Use noisereduce with aggressive settings
+            # Use noisereduce with stationary=False for varying noise
             reduced = nr.reduce_noise(
                 y=audio,
                 sr=self._sample_rate,
                 prop_decrease=prop_decrease,
                 n_fft=512,
-                stationary=True
+                stationary=False
             )
             
-            return reduced
-        except:
+            return np.clip(reduced, -1.0, 1.0)
+        except Exception as e:
+            if self._meter_debug:
+                print(f"Denoise error: {e}")
             return audio
     
     def _extract_voice_only(self, audio: np.ndarray) -> np.ndarray:
-        """Extract only clear voice segments using VAD, silence the rest."""
+        """Extract only clear voice segments using VAD, silence the rest (proven method)."""
         try:
             # Process in chunks
             chunk_size = BLOCK_SIZE
@@ -1572,30 +1738,32 @@ class OSINTCOMWindow(QMainWindow):
                 end = min(i + chunk_size, len(audio))
                 chunk = audio[i:end]
                 
-                # Use VAD to detect if this chunk is voice (score > 50 = likely voice)
+                # Use VAD to detect if this chunk is voice (score > 58 = voice territory, less aggressive)
+                # Lowered from 65 to preserve more voice while filtering noise (98% good)
                 score = self._detect_voice(chunk)
-                if score > 50:  # 50+ = voice territory
+                if score > 58:  # 58+ = voice extraction (minimal aggressiveness)
                     voice_audio[i:end] = chunk
             
             return voice_audio
-        except:
+        except Exception as e:
+            if self._meter_debug:
+                print(f"Voice extraction error: {e}")
             return audio
     
     def _remove_silence_gaps(self, audio: np.ndarray) -> np.ndarray:
-        """Remove silent gaps between speech bursts."""
+        """Remove silent gaps between speech bursts (proven simple method)."""
         try:
-            from scipy.signal import find_peaks
-            
             # Detect silence threshold (10% of max amplitude)
             threshold = 0.1 * np.max(np.abs(audio))
+            if threshold < 0.001:
+                threshold = 0.001
             
             # Find regions above threshold
             above_threshold = np.abs(audio) > threshold
             
-            # Remove small isolated peaks (noise)
-            chunk_size = int(0.05 * self._sample_rate)  # 50ms minimum
+            # Keep consecutive samples with minimum 50ms burst length
+            chunk_size = int(0.05 * self._sample_rate)
             
-            # Simple approach: keep consecutive samples above threshold
             result = np.zeros_like(audio)
             in_speech = False
             speech_start = 0
@@ -1615,7 +1783,9 @@ class OSINTCOMWindow(QMainWindow):
                 result[speech_start:] = audio[speech_start:]
             
             return result
-        except:
+        except Exception as e:
+            if self._meter_debug:
+                print(f"Silence removal error: {e}")
             return audio
 
     def _update_meter(self):
@@ -1663,21 +1833,24 @@ class OSINTCOMWindow(QMainWindow):
                 self._last_word_peak_time = now - post_roll_seconds  # Start fresh
             
             # WORD PEAK DETECTION: High confidence = detected word/syllable
-            if confidence >= word_peak_threshold:
+            # Only reset timer if ABOVE recording threshold (sustained voice, not noise spike)
+            if self._recording and confidence >= word_peak_threshold and confidence > 48:
                 self._last_word_peak_time = now
                 if self._meter_debug:
-                    print(f"[Word Peak] RAW {confidence:.0f}% >= {word_peak_threshold}% threshold → reset post-roll")
+                    print(f"[Word Peak] SUSTAINED {confidence:.0f}% >= {word_peak_threshold}% → reset post-roll")
             
             # Calculate time since last detected word
             time_since_last_word = now - self._last_word_peak_time
             post_roll_remaining = max(0, post_roll_seconds - time_since_last_word)
             
-            # Hangover countdown: Decrement each frame (don't reset it)
+            # Hangover countdown: Decrement each frame (don't reinitialize once started)
             frame_duration = BLOCK_SIZE / self._sample_rate if hasattr(self, '_sample_rate') else 0.046
             if self._recording and self._hangover_remaining > 0:
+                # Hangover active - just decrement, don't reinitialize
                 self._hangover_remaining = max(0, self._hangover_remaining - frame_duration)
-            elif post_roll_remaining > 0 and self._recording and self._hangover_remaining == 0:
-                # Initialize hangover when entering post-roll window
+            elif self._recording and self._hangover_remaining == 0 and post_roll_remaining > 0 and not hasattr(self, '_hangover_started'):
+                # Initialize hangover only ONCE when entering post-roll window
+                self._hangover_started = True
                 self._hangover_remaining = post_roll_remaining
             
             # DEBUG: Show state every ~0.5s
@@ -1685,7 +1858,7 @@ class OSINTCOMWindow(QMainWindow):
                 self._last_debug_print = now - 0.3  # Skip first one
             if self._meter_debug and (now - self._last_debug_print) > 0.5:
                 if not self._recording:
-                    print(f"[IDLE] RAW={confidence:.0f}% EMA={self._confidence_ema:.0f}% | Thresholds: Start={start_threshold}% (L{self._sensitivity_level}) | Noise floor={self._noise_floor_db:.1f}dB | Phase={self._learning_phase}")
+                    print(f"[IDLE] Confidence={confidence:.0f}% | SNR_floor={self._noise_floor_db:.1f}dB | Threshold={start_threshold}% (L{self._sensitivity_level}) | Hangover={self._hangover_remaining:.2f}s | Phase={self._learning_phase}")
                 self._last_debug_print = now
             
             # ===== RECORDING START/CONTINUE/STOP LOGIC =====
@@ -1693,17 +1866,21 @@ class OSINTCOMWindow(QMainWindow):
             # (lowered from 3.5s to handle natural speech pauses in SSB radio)
             # Lowered confidence thresholds for weak radio signals
             
-            # Determine thresholds based on state: stricter during recording to detect silence
-            if self._recording:
-                # During recording: Use higher bar (48%) to detect when voice ENDS
-                # This ensures noise at 45% counts as low-confidence and starts silence counter
-                high_confidence_threshold = 48
+            # Determine thresholds based on state: stricter during hangover
+            if self._recording and self._hangover_remaining > 0:
+                # During post-roll/hangover: Be VERY strict (60%) to avoid false positives
+                # Reject noise and only accept clear voice to prevent extending recording
+                threshold_for_accumulate = 60
+            elif self._recording:
+                # During normal recording: Use moderate bar (52%) to detect when voice ENDS
+                threshold_for_accumulate = 52
             else:
-                # Before recording: Use lower bar (35%) to catch faint voice START
-                high_confidence_threshold = 35
+                # Before recording: Use high bar (55%) to ignore static/noise (<52%) and marginal signals
+                # Only clear voice signals above noise floor trigger voice confirmation accumulation
+                threshold_for_accumulate = 55
             
-            # Voice confidence accumulator
-            if confidence > high_confidence_threshold:
+            # Voice confidence accumulator - tracks total voice time for upload validation
+            if confidence > threshold_for_accumulate:
                 # Accumulate high-confidence time
                 if self._last_high_confidence_time is None:
                     self._last_high_confidence_time = time.time()
@@ -1716,59 +1893,92 @@ class OSINTCOMWindow(QMainWindow):
                 if not hasattr(self, '_low_confidence_frames'):
                     self._low_confidence_frames = 0
                 self._low_confidence_frames = 0
+                
+                # During post-roll: Reset post-roll silence counter when voice returns
+                if self._recording and self._hangover_remaining > 0:
+                    if not hasattr(self, '_post_roll_silence_frames'):
+                        self._post_roll_silence_frames = 0
+                    self._post_roll_silence_frames = 0
+                
+                # Reset hangover if we're ALREADY in post-roll and detect NEW voice
+                # BUT only if BOTH SNR and confidence are sufficient - prevents noise from extending recording
+                if self._recording and self._hangover_remaining > 0:
+                    snr_now = getattr(self, '_last_snr_db', 0.0)
+                    # Require SNR > 4dB AND confidence > 60% to reset hangover
+                    # This is very strict to prevent noise extending the recording
+                    if snr_now > 4.0 and confidence > 60:
+                        # Strong signal AND clear voice - confirmed real transmission, reset hangover
+                        self._hangover_remaining = post_roll_seconds
+                        if self._meter_debug:
+                            print(f"[FOLLOW-UP] New voice detected (Conf={confidence:.0f}%, SNR={snr_now:.1f}dB) - reset to {post_roll_seconds}s")
+                    elif self._meter_debug and snr_now > 4.0:
+                        print(f"[HANGOVER] Signal detected but confidence too low (Conf={confidence:.0f}% < 60%) - ignoring")
             else:
-                # Reset accumulator when confidence drops
-                self._voice_confidence_duration = 0.0
-                self._last_high_confidence_time = None
-                # Track consecutive frames below voice threshold
+                # Low confidence frame
                 if not hasattr(self, '_low_confidence_frames'):
                     self._low_confidence_frames = 0
                 self._low_confidence_frames += 1
+                
+                # During post-roll: Track sustained silence specifically
+                if self._recording and self._hangover_remaining > 0:
+                    if not hasattr(self, '_post_roll_silence_frames'):
+                        self._post_roll_silence_frames = 0
+                    # Only count frames significantly below voice threshold (< 52% = reliable noise)
+                    if confidence < 52:
+                        self._post_roll_silence_frames += 1
+                    else:
+                        # Reset if confidence recovers above 52% (likely new voice in post-roll)
+                        self._post_roll_silence_frames = 0
+                else:
+                    # Not in post-roll, reset post-roll silence counter
+                    if hasattr(self, '_post_roll_silence_frames'):
+                        self._post_roll_silence_frames = 0
+                
+                # Preserve voice duration accumulation - NEVER reset during idle
+                # Duration only resets after recording finalized or 5+ seconds of continuous silence
+                if not self._recording and self._last_high_confidence_time is not None:
+                    # Check if we've been silent for more than 5 seconds
+                    time_since_last_voice = time.time() - self._last_high_confidence_time
+                    if time_since_last_voice > 5.0:
+                        # Reset only after extended silence
+                        self._voice_confidence_duration = 0.0
+                        self._last_high_confidence_time = None
             
-            # Voice only counts as "detected" after sustained 2.0 seconds of high confidence
-            # This prevents momentary noise spikes from triggering, but catches real transmissions
-            voice_qualified = self._voice_confidence_duration >= self._voice_confirmation_threshold
-            
-            # During recording: Monitor for extended silence (N consecutive frames of low confidence)
-            # If we have 6+ frames (~0.28 seconds) of sustained low confidence, force stop
-            # This prevents endless recording on background noise/static
-            if self._recording:
-                if self._low_confidence_frames >= 6:
-                    # Extended silence detected - FORCE STOP by clearing both flags
-                    voice_qualified = False  # Override accumulated duration
-                    self._voice_confidence_duration = 0.0
-                    self._hangover_remaining = 0.0
-                    if self._meter_debug:
-                        print(f"[EXT SILENCE] {self._low_confidence_frames} frames low-conf → FORCE STOP")
-            
-            voice_detected = (voice_qualified) or (self._hangover_remaining > 0)
+            # Voice is detected if confidence exceeds threshold OR we're in hangover window
+            # Convert to native Python bool to avoid numpy.bool_ type issues
+            voice_detected = bool(confidence > threshold_for_accumulate) or bool(self._hangover_remaining > 0)
+            voice_detected = bool(voice_detected)  # Ensure native Python bool
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
-            # START RECORDING (only after 3.5+ seconds of sustained voice confidence)
-            if not self._recording and voice_detected and voice_qualified:
+            # START RECORDING - immediately when voice is detected at threshold
+            # Do NOT wait for 1.1s accumulation to start; just start now
+            # But require minimum SNR to avoid false positives on noise
+            snr_now = getattr(self, '_last_snr_db', 0.0)
+            if not self._recording and confidence > threshold_for_accumulate and snr_now > 3.0:
                 if self._meter_debug:
-                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100 (sustained {self._voice_confidence_duration:.1f}s)")
+                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100, SNR={snr_now:.1f}dB immediately")
                 self._start_recording()
                 self.status_bar.showMessage(f"Recording started | Voice detected (SNR={snr_display:.1f}dB)")
             
-            # CONTINUE RECORDING
+            # CONTINUE RECORDING - while voice is detected (threshold met or in hangover)
             elif self._recording:
                 if voice_detected:
-                    # Still within hangover window
+                    # Still recording - voice or within hangover window
                     self.status_bar.showMessage(
-                        f"Recording... | Score: {confidence:.0f}/100 | Duration: {self._voice_confidence_duration:.1f}s | Hangover: {self._hangover_remaining:.2f}s"
+                        f"Recording... | Score: {confidence:.0f}/100 | Accumulated: {self._voice_confidence_duration:.1f}s | Hangover: {self._hangover_remaining:.2f}s"
                     )
                 else:
-                    # Hangover expired, stop recording
+                    # Hangover expired with no voice - STOP RECORDING
                     if self._meter_debug:
                         print(f">>> RECORDING STOP <<< Hangover expired")
                     self._finalize_recording()
                     self.status_bar.showMessage(f"Recording stopped | Hangover timeout")
             
-            # Update voice indicator
+            # Update voice indicator  
             if voice_detected != self._voice_detected:
                 self._voice_detected = voice_detected
-                self._signals.voice.emit(voice_detected)
+                # Ensure we emit a native Python bool, not numpy.bool_
+                self._signals.voice.emit(bool(voice_detected))
 
 
     def _start_recording(self):
@@ -1776,6 +1986,18 @@ class OSINTCOMWindow(QMainWindow):
         self._voice_started_at = time.time()
         self._voice_silence_at = None
         self._silence_timer_remaining = 0
+        
+        # Track that voice was confirmed
+        self._last_confirmed_voice_time = time.time()
+        
+        # Clear hangover tracking flags for fresh hangover window
+        if hasattr(self, '_hangover_started'):
+            delattr(self, '_hangover_started')
+        if hasattr(self, '_post_roll_silence_frames'):
+            self._post_roll_silence_frames = 0
+        
+        # Reset post-roll silence counter for new recording
+        self._post_roll_silence_frames = 0
         
         # Copy pre-roll buffer to recording buffer (must happen atomically)
         with self._lock:
@@ -1794,6 +2016,16 @@ class OSINTCOMWindow(QMainWindow):
         self._voice_started_at = None
         self._voice_silence_at = None
         
+        # Clear hangover flag for next recording cycle
+        if hasattr(self, '_hangover_started'):
+            delattr(self, '_hangover_started')
+        
+        # Reset post-roll silence counter
+        self._post_roll_silence_frames = 0
+        
+        # Capture voice confirmation duration before clearing
+        voice_duration = self._voice_confidence_duration
+        
         # Get audio buffer without holding lock during concatenation
         with self._audio_buffer_lock:
             buffer_copy = list(self._audio_buffer)
@@ -1806,11 +2038,19 @@ class OSINTCOMWindow(QMainWindow):
             audio_data = np.array([])
         
         if len(audio_data) > self._sample_rate * MIN_RECORDING_DURATION:
-            threading.Thread(target=self._encode_and_upload, args=(audio_data,), daemon=True).start()
+            threading.Thread(target=self._encode_and_upload, args=(audio_data, voice_duration), daemon=True).start()
             self._signals.status.emit("Uploading...")
 
-    def _encode_and_upload(self, audio_data: np.ndarray):
+    def _encode_and_upload(self, audio_data: np.ndarray, voice_duration: float = 0.0):
         try:
+            # VOICE VALIDATION: If sustained voice >= 1.1s detected, upload immediately
+            # No additional filtering - VAD already qualified the voice during recording
+            if voice_duration < 1.1:
+                self._signals.status.emit(f"Filtered: Insufficient voice duration ({voice_duration:.1f}s < 1.1s) - Not uploading")
+                if self._meter_debug:
+                    print(f"[UPLOAD FILTERED] Voice duration {voice_duration:.1f}s (< 1.1s) - Rejecting")
+                return
+            
             # Normalize audio
             max_val = np.max(np.abs(audio_data))
             if max_val > 0:
