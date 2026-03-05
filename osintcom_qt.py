@@ -1692,8 +1692,18 @@ class OSINTCOMWindow(QMainWindow):
             # v1.12c: Requires 2.0+ seconds of sustained high confidence for faint radio voices
             # (lowered from 3.5s to handle natural speech pauses in SSB radio)
             # Lowered confidence thresholds for weak radio signals
+            
+            # Determine thresholds based on state: stricter during recording to detect silence
+            if self._recording:
+                # During recording: Use higher bar (48%) to detect when voice ENDS
+                # This ensures noise at 45% counts as low-confidence and starts silence counter
+                high_confidence_threshold = 48
+            else:
+                # Before recording: Use lower bar (35%) to catch faint voice START
+                high_confidence_threshold = 35
+            
             # Voice confidence accumulator
-            if confidence > 35:  # Lowered from 45 for weak signals
+            if confidence > high_confidence_threshold:
                 # Accumulate high-confidence time
                 if self._last_high_confidence_time is None:
                     self._last_high_confidence_time = time.time()
@@ -1720,14 +1730,16 @@ class OSINTCOMWindow(QMainWindow):
             voice_qualified = self._voice_confidence_duration >= self._voice_confirmation_threshold
             
             # During recording: Monitor for extended silence (N consecutive frames of low confidence)
-            # If we have 6+ frames (~0.28 seconds) of sustained low confidence, force hangover
+            # If we have 6+ frames (~0.28 seconds) of sustained low confidence, force stop
             # This prevents endless recording on background noise/static
             if self._recording:
                 if self._low_confidence_frames >= 6:
-                    # Extended silence detected - force hangover to trigger cleanup
+                    # Extended silence detected - FORCE STOP by clearing both flags
+                    voice_qualified = False  # Override accumulated duration
+                    self._voice_confidence_duration = 0.0
                     self._hangover_remaining = 0.0
                     if self._meter_debug:
-                        print(f"[EXT SILENCE] {self._low_confidence_frames} frames of low confidence → force hangover=0")
+                        print(f"[EXT SILENCE] {self._low_confidence_frames} frames low-conf → FORCE STOP")
             
             voice_detected = (voice_qualified) or (self._hangover_remaining > 0)
             snr_display = getattr(self, '_last_snr_db', -60.0)
