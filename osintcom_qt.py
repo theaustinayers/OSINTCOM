@@ -1672,8 +1672,12 @@ class OSINTCOMWindow(QMainWindow):
             time_since_last_word = now - self._last_word_peak_time
             post_roll_remaining = max(0, post_roll_seconds - time_since_last_word)
             
-            # Use post-roll to extend hangover (10 seconds of silence/decay after last word)
-            if post_roll_remaining > 0 and self._recording:
+            # Hangover countdown: Decrement each frame (don't reset it)
+            frame_duration = BLOCK_SIZE / self._sample_rate if hasattr(self, '_sample_rate') else 0.046
+            if self._recording and self._hangover_remaining > 0:
+                self._hangover_remaining = max(0, self._hangover_remaining - frame_duration)
+            elif post_roll_remaining > 0 and self._recording and self._hangover_remaining == 0:
+                # Initialize hangover when entering post-roll window
                 self._hangover_remaining = post_roll_remaining
             
             # DEBUG: Show state every ~0.5s
