@@ -1,16 +1,22 @@
 {
-  "device": "\ud83c\udfa4 DAX Audio RX 1 (FlexRadio Syste (ID 7)",
+  "device": "\ud83c\udfa4 DAX Audio RX 2 (FlexRadio Syste (ID 17)",
   "sensitivity": 3,
   "frequency": "15016 kHz",
-  "webhook_url": "\u2713 Webhook configured (3MGTiW5oyEQDqBAnwgqm)",
+  "webhooks": [
+    {
+      "nickname": "Legacy Webhook",
+      "url": "3MGTiW5oyEQDqBAnwgqm",
+      "enabled": true
+    }
+  ],
   "custom_message": "",
-  "role_id": "",
   "file_location": "C:\\Users\\theau\\Documents\\OSINTCOM",
   "audio_settings": {
     "use_bandpass": true,
     "use_denoise": true,
     "denoise_strength": 6,
     "remove_silence": false,
-    "voice_extract": true
+    "voice_extract": true,
+    "voice_extract_threshold": 58
   }
 }

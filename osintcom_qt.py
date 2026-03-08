@@ -16,6 +16,12 @@ import wave
 import struct
 import uuid
 
+# FIX: Set Qt plugin path for cx_Freeze bundled executable
+_base_path = os.path.dirname(sys.executable if hasattr(sys, 'frozen') else __file__)
+_plugin_path = os.path.join(_base_path, 'PyQt5', 'plugins')
+if os.path.exists(_plugin_path):
+    os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _plugin_path
+
 import numpy as np
 import sounddevice as sd
 import requests
@@ -606,11 +612,12 @@ class OSINTCOMWindow(QMainWindow):
         # SSB-friendly SNR gate: use rolling minimum of last 2s
         self._snr_percentile_window = 87  # ~2 seconds of SNR samples
         
-        # Voice confirmation timer - requires 2.0 seconds of sustained high confidence
-        # Lowered from 3.5s for faint radio voices with natural pauses
+        # Voice confirmation timer - requires 3.0 seconds of sustained high confidence
+        # Strict pitch-based filtering: 65% confidence, 5.5dB SNR, 15pt+ pitch minimum
         self._voice_confidence_duration = 0.0  # Cumulative seconds of high confidence
-        self._voice_confirmation_threshold = 1.1  # Seconds of voice confidence needed (1.1s minimum for stability)
+        self._voice_confirmation_threshold = 3.0  # Seconds of voice confidence needed (3.0s minimum to filter HF noise)
         self._last_high_confidence_time = None  # Timestamp of last high confidence frame
+        self._last_pitch_score = 0.0  # Store pitch score for voice-only detection
         
         # Signal-based VAD (no ML dependencies)
         self._silero_model = None
@@ -1344,11 +1351,13 @@ class OSINTCOMWindow(QMainWindow):
             # ===== LAYER 2: PITCH DETECTION =====
             # Voice fundamental ~85-250Hz. Best single discriminator for SSB voice.
             # Weight: 35pts (strongest discriminator - silence pitch stays 0.10-0.20)
+            pitch_score = 0.0  # Default for silence
             if confidence > 0:
                 pitch_score = self._detect_pitch(audio)  # Returns 0-35
                 confidence += pitch_score
                 if debug:
                     print(f"  Layer 2 Pitch: +{pitch_score:.0f} (total: {confidence:.0f})")
+            self._last_pitch_score = pitch_score  # Store for recording gate
             
             # ===== LAYER 3: SPECTRAL ENTROPY =====
             # Voice: organized spectrum (low entropy), Silence: flat carrier (high entropy)
@@ -1378,6 +1387,14 @@ class OSINTCOMWindow(QMainWindow):
                 confidence += zcr_score
                 if debug:
                     print(f"  Layer 4 ZCR: +{zcr_score:.0f} (total: {confidence:.0f})")
+            
+            # ===== DATA SIGNAL DETECTION: Frequency Stability Check =====
+            # DISABLED: Initial approach too aggressive
+            # Will implement improved detection in v1.14
+            # if confidence > 25:  # Only check if likely to be non-noise
+            #     freq_stability = self._detect_frequency_stability(audio)
+            #     if freq_stability > 0.85:  # Too stable = likely data signal
+            #         confidence = max(5.0, confidence - 30.0)
             
             # ===== MODULATION CHECK: Boost/Penalty =====
             # Natural voice has 0.25-0.60 coefficient of variation
@@ -1548,6 +1565,67 @@ class OSINTCOMWindow(QMainWindow):
                 return (0.30 - zcr) / 0.20 * 15.0
         except:
             return 2.0  # Small credit for attempting ZCR check
+    
+    def _detect_frequency_stability(self, audio: np.ndarray) -> float:
+        """Detect frequency stability to discriminate data signals from voice.
+        
+        Voice: Dynamic pitch changes, varying formants → peak shift 0.15-0.25
+        Data (FSK/RTTY/MFSK): Fixed frequency tones → peak shift <0.10
+        
+        Returns: 0-1 score, where >0.85 indicates likely data signal (stable)
+        """
+        try:
+            # Split audio into 4 subframes to detect peak movement
+            if len(audio) < 512:
+                return 0.0
+            
+            subframe_size = len(audio) // 4
+            if subframe_size < 256:
+                return 0.0
+            
+            peak_freqs = []
+            
+            for i in range(4):
+                start = i * subframe_size
+                end = start + subframe_size if i < 3 else len(audio)
+                subframe = audio[start:end]
+                
+                # Get spectrum
+                window = np.hamming(len(subframe))
+                subframe_windowed = subframe * window
+                fft_data = np.fft.rfft(subframe_windowed)
+                power = np.abs(fft_data) ** 2
+                
+                # Find dominant peak (skip DC)
+                power[0] = 0
+                if len(power) > 0:
+                    peak_idx = np.argmax(power)
+                    freq = peak_idx * self._sample_rate / len(subframe_windowed)
+                    peak_freqs.append(freq)
+            
+            if len(peak_freqs) < 2:
+                return 0.0
+            
+            # Measure variation in peak frequencies
+            peak_freqs = np.array(peak_freqs)
+            freq_changes = np.abs(np.diff(peak_freqs))
+            
+            # Normalize by average frequency to get relative stability
+            avg_freq = np.mean(peak_freqs)
+            if avg_freq > 100:  # Skip very low frequencies
+                relative_changes = freq_changes / avg_freq
+            else:
+                relative_changes = freq_changes / 500.0  # Fallback normalization
+            
+            # Stability = 1 - average relative change
+            # High stability (data) = small changes → score 0.9+
+            # Low stability (voice) = large changes → score 0.3-0.6
+            avg_relative_change = np.mean(relative_changes)
+            stability = 1.0 - np.clip(avg_relative_change, 0, 1.0)
+            
+            return float(stability)
+        except:
+            return 0.0  # Default: uncertainty, allow normal scoring
     
     def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
         """Check for speech-like modulation at 3-8 Hz (syllabic rate).
@@ -1945,6 +2023,10 @@ class OSINTCOMWindow(QMainWindow):
         """Apply audio processing filters based on user settings."""
         processed = audio.copy()
         
+        # 0. Spectral gate (aggressive out-of-band noise removal)
+        # Applied first as a surgical filter before other processing
+        processed = self._apply_spectral_gate(processed)
+        
         # 1. Bandpass filter (300-3000 Hz SSB speech)
         if self._audio_settings.get("use_bandpass", False):
             processed = self._apply_bandpass_filter(processed)
@@ -1963,6 +2045,91 @@ class OSINTCOMWindow(QMainWindow):
             processed = self._remove_silence_gaps(processed)
         
         return processed
+    
+    def _apply_spectral_gate(self, audio: np.ndarray) -> np.ndarray:
+        """Apply aggressive spectral gating to suppress out-of-band noise.
+        
+        Uses FFT to identify and suppress frequencies outside voice band (300-3000 Hz).
+        Preserves voice formants while suppressing static and HF noise.
+        """
+        try:
+            # Process in overlapping frames for smoothness
+            frame_size = 2048
+            overlap = frame_size // 2
+            hop_size = frame_size - overlap
+            
+            if len(audio) < frame_size:
+                return audio
+            
+            output = np.zeros_like(audio)
+            window = np.hamming(frame_size)
+            
+            # Frequency bands for gating
+            # Voice: 300-3000 Hz (strong gate)
+            # Sub-band: 100-300 Hz (medium gate, allows bass)
+            # Super-band: 3000-5000 Hz (light gate, allows harmonics)
+            
+            for start in range(0, len(audio) - frame_size, hop_size):
+                end = start + frame_size
+                frame = audio[start:end] * window
+                
+                # FFT
+                spectrum = np.fft.rfft(frame)
+                magnitude = np.abs(spectrum)
+                phase = np.angle(spectrum)
+                
+                # Create frequency array
+                freqs = np.fft.rfftfreq(frame_size, 1.0 / self._sample_rate)
+                
+                # Gating envelope (soft knees for smoothness)
+                gate = np.ones_like(freqs)
+                
+                # Sub-voice band (0-100 Hz): reduce by 70%
+                sub_band = freqs < 100
+                gate[sub_band] = 0.3
+                
+                # Super-voice band (5000+ Hz): reduce by 80%
+                super_band = freqs > 5000
+                gate[super_band] = 0.2
+                
+                # Very high freq (>7000 Hz): reduce by 95% (hiss/crackle)
+                very_high = freqs > 7000
+                gate[very_high] = 0.05
+                
+                # Apply smooth transition at edges of voice band
+                # 300-500 Hz: ramp from 30% → 100%
+                voice_start_edge = (freqs >= 100) & (freqs < 300)
+                gate[voice_start_edge] = 0.3 + (freqs[voice_start_edge] - 100) / 200 * 0.7
+                
+                # 3000-5000 Hz: ramp from 100% → 20%
+                voice_end_edge = (freqs > 3000) & (freqs <= 5000)
+                gate[voice_end_edge] = 1.0 - (freqs[voice_end_edge] - 3000) / 2000 * 0.8
+                
+                # Apply gating
+                spectrum_gated = spectrum * gate
+                
+                # IFFT
+                frame_out = np.fft.irfft(spectrum_gated, n=frame_size)
+                frame_out = frame_out * window
+                
+                # Overlap-add
+                output[start:end] += frame_out
+            
+            # Handle final frame if needed
+            if end < len(audio):
+                remaining = len(audio) - end
+                output[end:] = audio[end:] * 0.5  # Reduce tail
+            
+            # Normalize to prevent clipping
+            max_val = np.max(np.abs(output))
+            if max_val > 1.0:
+                output = output / max_val
+            
+            return np.clip(output, -1.0, 1.0)
+        except Exception as e:
+            if self._meter_debug:
+                print(f"Spectral gate error: {e}")
+            return audio
     
     def _apply_bandpass_filter(self, audio: np.ndarray) -> np.ndarray:
         """Apply bandpass filter 300-3000 Hz for SSB speech using scipy."""
@@ -2183,18 +2350,19 @@ class OSINTCOMWindow(QMainWindow):
                     self._post_roll_silence_frames = 0
                 
                 # Reset hangover if we're ALREADY in post-roll and detect NEW voice
-                # BUT only if BOTH SNR and confidence are sufficient - prevents noise from extending recording
+                # BUT only if SNR, confidence, AND pitch are sufficient - prevents noise from extending recording
                 if self._recording and self._hangover_remaining > 0:
                     snr_now = getattr(self, '_last_snr_db', 0.0)
-                    # Require SNR > 4dB AND confidence > 60% to reset hangover
-                    # This is very strict to prevent noise extending the recording
-                    if snr_now > 4.0 and confidence > 60:
-                        # Strong signal AND clear voice - confirmed real transmission, reset hangover
+                    pitch_score = getattr(self, '_last_pitch_score', 0.0)
+                    # Require SNR > 5.5dB AND confidence > 65% AND pitch >= 15pts to reset hangover
+                    # Strict filtering prevents noise from extending recordingk
+                    if snr_now > 5.5 and confidence > 65 and pitch_score >= 15.0:
+                        # Strong signal AND clear voice with pitch - confirmed real transmission, reset hangover
                         self._hangover_remaining = post_roll_seconds
                         if self._meter_debug:
-                            print(f"[FOLLOW-UP] New voice detected (Conf={confidence:.0f}%, SNR={snr_now:.1f}dB) - reset to {post_roll_seconds}s")
-                    elif self._meter_debug and snr_now > 4.0:
-                        print(f"[HANGOVER] Signal detected but confidence too low (Conf={confidence:.0f}% < 60%) - ignoring")
+                            print(f"[FOLLOW-UP] New voice detected (Conf={confidence:.0f}%, SNR={snr_now:.1f}dB, Pitch={pitch_score:.0f}pts) - reset to {post_roll_seconds}s")
+                    elif self._meter_debug and (snr_now > 5.5 or confidence > 65):
+                        print(f"[HANGOVER] Signal (Conf={confidence:.0f}%, SNR={snr_now:.1f}dB, Pitch={pitch_score:.0f}pts) doesn't meet all criteria - ignoring")
             else:
                 # Low confidence frame
                 if not hasattr(self, '_low_confidence_frames'):
@@ -2232,11 +2400,11 @@ class OSINTCOMWindow(QMainWindow):
             voice_detected = bool(voice_detected)  # Ensure native Python bool
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
-            # START RECORDING - immediately when voice is detected at threshold
-            # Do NOT wait for 1.1s accumulation to start; just start now
-            # But require minimum SNR to avoid false positives on noise
+            # START RECORDING - only on sustained high-confidence voice with pitch
+            # Require confidence > 65% AND SNR > 5.5dB AND pitch >= 15pts to filter HF noise
             snr_now = getattr(self, '_last_snr_db', 0.0)
-            if not self._recording and confidence > threshold_for_accumulate and snr_now > 3.0:
+            pitch_score = getattr(self, '_last_pitch_score', 0.0)
+            if not self._recording and confidence > 65.0 and snr_now > 5.5 and pitch_score >= 15.0:
                 if self._meter_debug:
                     print(f">>> RECORDING START <<< Score {confidence:.0f}/100, SNR={snr_now:.1f}dB immediately")
                 self._start_recording()
@@ -2268,6 +2436,11 @@ class OSINTCOMWindow(QMainWindow):
         self._voice_started_at = time.time()
         self._voice_silence_at = None
         self._silence_timer_remaining = 0
+        
+        # CRITICAL FIX: Reset confidence duration accumulator when recording starts
+        # This ensures only voice time DURING recording counts, not static accumulated before
+        self._voice_confidence_duration = 0.0
+        self._last_high_confidence_time = None
         
         # Track that voice was confirmed
         self._last_confirmed_voice_time = time.time()
@@ -2327,13 +2500,25 @@ class OSINTCOMWindow(QMainWindow):
 
     def _encode_and_upload(self, audio_data: np.ndarray, voice_duration: float = 0.0):
         try:
-            # VOICE VALIDATION: If sustained voice >= 1.1s detected, upload immediately
-            # No additional filtering - VAD already qualified the voice during recording
-            if voice_duration < 1.1:
-                self._signals.status.emit(f"Filtered: Insufficient voice duration ({voice_duration:.1f}s < 1.1s) - Not uploading")
+            # VOICE VALIDATION: Strict filtering - sustained voice >= 3.0s required
+            # Enforces 3.0s minimum duration + 65% confidence + 5.5dB SNR + 15pt pitch
+            if voice_duration < 3.0:
+                self._signals.status.emit(f"Filtered: Insufficient voice duration ({voice_duration:.1f}s < 3.0s) - Not uploading")
                 if self._meter_debug:
-                    print(f"[UPLOAD FILTERED] Voice duration {voice_duration:.1f}s (< 1.1s) - Rejecting")
+                    print(f"[UPLOAD FILTERED] Voice duration {voice_duration:.1f}s (< 3.0s) - Rejecting")
                 return
+            
+            # PRE-UPLOAD VALIDATION: Final voice verification
+            # Uses strict multi-factor analysis to prevent uploading noise/static
+            validation_score, validation_msg = self._validate_recording_for_upload(audio_data)
+            if validation_score < 0.65:  # Must pass 65% upload quality threshold
+                self._signals.status.emit(f"Filtered: Recording failed upload validation ({validation_score:.0%}) - {validation_msg[:50]}")
+                if self._meter_debug:
+                    print(f"[UPLOAD VALIDATION FAILED] Score: {validation_score:.0%} - {validation_msg}")
+                return
+            
+            if self._meter_debug:
+                print(f"[UPLOAD VALIDATION PASSED] Score: {validation_score:.0%}")
             
             # Normalize audio
             max_val = np.max(np.abs(audio_data))
@@ -2359,8 +2544,221 @@ class OSINTCOMWindow(QMainWindow):
         except Exception as e:
             self._signals.error.emit(f"Encoding/upload failed: {e}")
 
+    def _validate_recording_for_upload(self, audio: np.ndarray) -> tuple:
+        """Final validation gate before uploading recording to Discord.
+        
+        Uses basic audio quality checks (not full VAD re-analysis):
+        1. Average energy level (must have content)
+        2. Syllabic modulation (speech-like envelope variation)
+        3. Spectral profile consistency (voice vs noise)
+        4. Peak-to-noise ratio
+        
+        Does NOT re-run full _detect_voice (avoids VAD state issues).
+        If recording triggered and lasted 3.0s+, it's likely real voice.
+        
+        Returns: (validation_score: 0-1, message: str)
+        """
+        try:
+            audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
+            
+            # ===== CHECK 1: Sufficient Energy =====
+            rms_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
+            
+            # Voice recordings should be at least -20 dB (relative to 0dB peak)
+            if rms_db < -35.0:
+                return 0.0, f"Insufficient energy ({rms_db:.1f} dB)"
+            
+            energy_score = min(1.0, (rms_db + 20.0) / 10.0)  # Full score at -10 dB
+            if self._meter_debug:
+                print(f"  [VAL] Energy: {rms_db:.1f} dB → {energy_score:.0%}")
+            
+            # ===== CHECK 2: Syllabic Modulation =====
+            modulation_score = self._check_upload_syllabic_modulation(audio)
+            if modulation_score < 0.20:  # LOWERED from 0.25 - be more lenient
+                return 0.0, f"No syllabic modulation ({modulation_score:.2f})"
+            
+            if self._meter_debug:
+                print(f"  [VAL] Syllabic modulation: {modulation_score:.0%}")
+            
+            # ===== CHECK 3: Spectral Consistency =====
+            spectral_score = self._check_upload_spectral_consistency(audio)
+            if self._meter_debug:
+                print(f"  [VAL] Spectral consistency: {spectral_score:.0%}")
+            
+            # ===== CHECK 4: Peak-to-Noise Ratio =====
+            # Simple check: signal should have defined peaks (voice), not flat (noise)
+            peak = np.max(np.abs(audio))
+            rms = np.sqrt(np.mean(audio ** 2))
+            
+            if rms < 1e-10:
+                return 0.0, "No audio signal"
+            
+            crest = peak / (rms + 1e-10)
+            
+            # Voice has crest factor ~2.0-2.5, noise ~1.0-1.5
+            if crest < 1.3:
+                peak_score = 0.0
+            elif crest > 2.0:
+                peak_score = 1.0
+            else:
+                peak_score = (crest - 1.3) / 0.7  # Linear between 1.3 and 2.0
+            
+            if self._meter_debug:
+                print(f"  [VAL] Crest factor: {crest:.2f} → {peak_score:.0%}")
+            
+            # ===== COMBINED SCORE =====
+            # Weight: Energy (30%), Modulation (35%), Spectral (20%), Peak (15%)
+            final_score = (
+                energy_score * 0.30 +
+                modulation_score * 0.35 +
+                spectral_score * 0.20 +
+                peak_score * 0.15
+            )
+            
+            if self._meter_debug:
+                print(f"  [VAL FINAL] {final_score:.0%} (E:{energy_score:.0%} M:{modulation_score:.0%} S:{spectral_score:.0%} P:{peak_score:.0%})")
+            
+            return final_score, "Recording passed validation"
+        
+        except Exception as e:
+            return 0.0, f"Validation error: {str(e)[:40]}"
+
+    def _calculate_chunk_snr(self, chunk: np.ndarray) -> float:
+        """Calculate SNR of a single audio chunk."""
+        try:
+            # Apply bandpass filter to isolate speech band
+            sos = butter(4, [300, 3000], btype='band', fs=self._sample_rate, output='sos')
+            filtered = sosfiltfilt(sos, chunk)
+            
+            # Signal = filtered (voice band), Noise = full - filtered (out of band)
+            signal_rms = np.sqrt(np.mean(filtered ** 2))
+            noise = chunk - filtered
+            noise_rms = np.sqrt(np.mean(noise ** 2))
+            
+            if noise_rms < 1e-10:
+                return 20.0
+            
+            snr_db = 20 * np.log10((signal_rms + 1e-10) / (noise_rms + 1e-10))
+            return np.clip(snr_db, -20.0, 30.0)
+        except:
+            return 0.0
+
+    def _check_upload_syllabic_modulation(self, audio: np.ndarray) -> float:
+        """Check for speech-like syllabic modulation in recording.
+        
+        Speech has clear envelope modulation at syllable rate (~3-8 Hz).
+        Static/noise has random or flat envelope.
+        
+        Returns: 0-1 score (higher = more speech-like)
+        """
+        try:
+            # Compute envelope via RMS in short windows
+            window = 256  # ~6ms at 44kHz
+            envelope = []
+            
+            for i in range(0, len(audio) - window, window):
+                rms = np.sqrt(np.mean(audio[i:i+window] ** 2))
+                envelope.append(rms)
+            
+            if len(envelope) < 10:
+                return 0.3
+            
+            envelope = np.array(envelope, dtype=np.float32)
+            
+            # Normalize envelope
+            env_mean = np.mean(envelope)
+            if env_mean < 1e-10:
+                return 0.2
+            
+            envelope_norm = envelope / (env_mean + 1e-10)
+            
+            # Check for variation (speech varies, static is flat)
+            envelope_energy = np.var(envelope_norm)  # Higher = more variation
+            
+            # Speech recordings have envelope variance ~0.05-0.15
+            # Static recordings have variance ~0.01-0.03
+            
+            if envelope_energy > 0.10:
+                modulation = 1.0  # Strong modulation
+            elif envelope_energy > 0.05:
+                modulation = (envelope_energy - 0.05) / 0.05  # Partial modulation
+            elif envelope_energy > 0.02:
+                modulation = (envelope_energy - 0.02) / 0.03 * 0.5  # Weak modulation
+            else:
+                modulation = 0.1  # Flat envelope = static
+            
+            if self._meter_debug:
+                print(f"    [Modulation energy: {envelope_energy:.4f} → {modulation:.0%}]")
+            
+            return np.clip(modulation, 0.0, 1.0)
+        except:
+            return 0.3
+
+    def _check_upload_spectral_consistency(self, audio: np.ndarray) -> float:
+        """Check spectral shape consistency across recording.
+        
+        Voice has consistent formant structure; noise/static varies.
+        Compares spectral shape of first vs second half of recording.
+        
+        Returns: 0-1 score (higher = more consistent = more voice-like)
+        """
+        try:
+            # Split audio in half
+            mid = len(audio) // 2
+            first_half = audio[:mid]
+            second_half = audio[mid:]
+            
+            if len(first_half) < 512 or len(second_half) < 512:
+                return 0.5
+            
+            # Compute spectra with Welch method
+            from scipy.signal import welch
+            
+            f1, p1 = welch(first_half, fs=self._sample_rate, nperseg=512)
+            f2, p2 = welch(second_half, fs=self._sample_rate, nperseg=512)
+            
+            # Normalize power
+            p1 = p1 / (np.max(p1) + 1e-10)
+            p2 = p2 / (np.max(p2) + 1e-10)
+            
+            # Compute correlation between spectral shapes (0-1)
+            # Voice: high correlation (~0.7-0.95), Static: low (~0.3-0.6)
+            correlation = np.corrcoef(p1[:256], p2[:256])[0, 1]
+            correlation = np.nan_to_num(correlation, nan=0.0, posinf=1.0, neginf=0.0)
+            correlation = np.clip(correlation, 0.0, 1.0)
+            
+            # Map correlation to score: <0.4 = 0%, >0.7 = 100%
+            if correlation > 0.70:
+                score = 1.0
+            elif correlation > 0.50:
+                score = (correlation - 0.50) / 0.20
+            elif correlation > 0.30:
+                score = (correlation - 0.30) / 0.20 * 0.5
+            else:
+                score = 0.0
+            
+            if self._meter_debug:
+                print(f"    [Spectral correlation: {correlation:.2f} → {score:.0%}]")
+            
+            return score
+        except:
+            return 0.5
+
     def _upload_to_discord(self, filepath: str):
         try:
+            # Verify file exists and is readable before attempting upload
+            if not os.path.exists(filepath):
+                self._signals.error.emit(f"Upload failed: File not found - {filepath}")
+                return
+            
+            file_size = os.path.getsize(filepath)
+            if file_size == 0:
+                self._signals.error.emit(f"Upload failed: File is empty - {filepath}")
+                return
+            
+            if self._meter_debug:
+                print(f"[UPLOAD] Starting upload of {os.path.basename(filepath)} ({file_size} bytes)")
+            
             # Send to all enabled webhooks
             for webhook in self._webhooks:
                 if webhook.get("enabled", True):
@@ -2378,16 +2776,37 @@ class OSINTCOMWindow(QMainWindow):
                             }]
                         }
                         
-                        with open(filepath, 'rb') as f:
-                            files = {'file1': (os.path.basename(filepath), f)}
-                            data = {'payload_json': json.dumps(payload)}
-                            requests.post(webhook.get("url"), data=data, files=files, timeout=30)
-                    except Exception as e:
+                        # Read file once into memory before posting
+                        try:
+                            with open(filepath, 'rb') as f:
+                                file_data = f.read()
+                        except Exception as e:
+                            raise Exception(f"Failed to read file: {e}")
+                        
+                        if len(file_data) == 0:
+                            raise Exception("File read returned empty data")
+                        
+                        # Now upload with file data already in memory
+                        files = {'file1': (os.path.basename(filepath), file_data)}
+                        data = {'payload_json': json.dumps(payload)}
+                        
+                        response = requests.post(webhook.get("url"), data=data, files=files, timeout=30)
+                        response.raise_for_status()  # Raise exception for bad HTTP status
+                        
                         nickname = webhook.get("nickname", "Unknown")
                         if self._meter_debug:
-                            print(f"Failed to upload to '{nickname}': {e}")
+                            print(f"[UPLOAD] Successfully uploaded to '{nickname}' (HTTP {response.status_code})")
+                    
+                    except Exception as e:
+                        nickname = webhook.get("nickname", "Unknown")
+                        self._signals.error.emit(f"Upload to '{nickname}' failed: {e}")
+                        if self._meter_debug:
+                            print(f"[UPLOAD ERROR] Failed to upload to '{nickname}': {e}")
+                            traceback.print_exc()
         except Exception as e:
             self._signals.error.emit(f"Discord upload failed: {e}")
+            if self._meter_debug:
+                traceback.print_exc()
 
     def _on_level(self, db):
         pass
