@@ -27,6 +27,7 @@ def build():
         "--name=OSINTCOM",
         f"--icon={icon_path}",
         "--onedir",  # onedir uses far less RAM than onefile during build
+        "--noconfirm",  # don't prompt when overwriting dist output folder
         "--windowed",
         "--add-data=icon.ico:.",
         "--hidden-import=sounddevice",
