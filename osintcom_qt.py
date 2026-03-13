@@ -2693,12 +2693,22 @@ class OSINTCOMWindow(QMainWindow):
 
     def _encode_and_upload(self, audio_data: np.ndarray, voice_duration: float = 0.0):
         try:
-            # VOICE VALIDATION SKIP: VAD already confirmed 3.0s of voice activity
-            # Secondary validation removed - it was overly restrictive for radio signals
-            # If recording passed VAD's stringent 3.0s confirmation, it's legitimate
+            # MINIMAL ARTIFACT FILTERING: Only reject obvious silence
+            # Short bursts (static, sweeps, etc.) are allowed through
+            # Better to upload an artifact than miss real voice
             
+            rms_db = 20 * np.log10(np.sqrt(np.mean(audio_data ** 2)) + 1e-10)
+            
+            # REJECT: Only if essentially silent (RMS too low)
+            if rms_db < -60.0:
+                self._signals.status.emit(f"Filtered: Signal too quiet ({rms_db:.1f} dB)")
+                if self._meter_debug:
+                    print(f"[ARTIFACT REJECTED] Too quiet: {rms_db:.1f} dB")
+                return
+            
+            # Otherwise: Upload even if it's a brief burst
             if self._meter_debug:
-                print(f"[UPLOAD APPROVED] Recording passed VAD (duration: {voice_duration:.1f}s) - Proceeding to upload")
+                print(f"[UPLOAD APPROVED] Brief burst recorded (RMS:{rms_db:.1f}dB) - Uploading")
             
             # Normalize audio
             max_val = np.max(np.abs(audio_data))
