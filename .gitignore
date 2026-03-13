@@ -44,3 +44,32 @@ Thumbs.db
 Documents/OSINTCOM/
 *.wav
 *.mp3
+
+# IQ captures & analysis scripts
+*.npy
+*.csv
+capture_iq*.py
+analyze_*.py
+vad_analysis.py
+vad_v*.py
+validate_*.py
+VAD_v119_*.py
+VAD_v119_*.md
+test_vad_v*.py
+
+# Build logs
+build.log
+build_*.log
+build_log_*.txt
+
+# Images (screenshots, photos)
+*.png
+*.jpg
+*.jpeg
+
+# UPX
+upx-*/
+upx.zip
+
+# Error log
+error.log

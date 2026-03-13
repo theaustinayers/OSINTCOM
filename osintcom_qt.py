@@ -5,16 +5,12 @@ PyQt5 GUI with real-time audio monitoring, VAD, recording, and Discord integrati
 
 import sys
 import os
-import io
 import time
 import threading
 import datetime
 import json
 import collections
 import traceback
-import wave
-import struct
-import uuid
 
 # FIX: Set Qt plugin path for cx_Freeze bundled executable
 _base_path = os.path.dirname(sys.executable if hasattr(sys, 'frozen') else __file__)
@@ -25,8 +21,7 @@ if os.path.exists(_plugin_path):
 import numpy as np
 import sounddevice as sd
 import requests
-from scipy.signal import butter, sosfiltfilt, welch, get_window
-from scipy.fftpack import fft
+from scipy.signal import butter, sosfiltfilt, welch, find_peaks
 try:
     import noisereduce as nr
     HAS_NOISEREDUCE = True
@@ -50,44 +45,31 @@ CONFIG_FILE = "osintcom_config.json"
 CHANNELS = 1
 BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
-POST_ROLL_SECONDS = 10.0  # 10 seconds of silence/decay after last word peak
-MIN_VOICE_DURATION = 0.5
 MIN_RECORDING_DURATION = 1.5
-VAD_SMOOTHING_WINDOW = 3  # Confidence smoothing window
-VAD_WORD_PEAK_THRESHOLD = 75  # Confidence needed to consider it a word
-VAD_START_CONFIDENCE = 65  # Start recording threshold
-VAD_CONTINUE_CONFIDENCE = 30  # Continue recording threshold
-VAD_STOP_CONFIDENCE = 20  # Stop recording threshold
 
-# Confidence-Based Professional VAD (v1.06)
-# Scores voice 0-100 based on: energy, band dominance, spectral entropy, ZCR, pitch
-# Detects word peaks and uses 10-second post-roll from last word
+# Formant-Primary VAD v1.20 — Sensitivity presets
+# Scores voice 0-100: Formants(40) + VoiceBand(20) + SNR(15) + Pitch(15) + Modulation(10)
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches faintest voices, accepts some noise
-    1: {"confidence_start": 48, "confidence_continue": 20, "confidence_stop": 8,
-        "word_peak_threshold": 66, "post_roll_seconds": 10,
-        "energy_weight": 0.25, "band_weight": 0.20, "entropy_weight": 0.35,
-        "zcr_weight": 0.15, "pitch_weight": 0.05, "noise_floor_db": -68},
-    # Level 2: Very sensitive - good for weak radio, some noise accepted
-    2: {"confidence_start": 55, "confidence_continue": 28, "confidence_stop": 12,
+    # Level 1: Maximum sensitivity - Speech formant primary detection (v1.19)
+    1: {"confidence_start": 40, "confidence_continue": 15, "confidence_stop": 5,
+        "word_peak_threshold": 60, "post_roll_seconds": 10,
+        "formant_threshold_db": 3, "min_formants": 1, "noise_floor_db": -68},
+    # Level 2: Very sensitive - good for weak radio SSB/USB
+    2: {"confidence_start": 48, "confidence_continue": 20, "confidence_stop": 8,
+        "word_peak_threshold": 65, "post_roll_seconds": 10,
+        "formant_threshold_db": 5, "min_formants": 1, "noise_floor_db": -65},
+    # Level 3: Balanced (default) - formant-focused, reliable on weak stations
+    3: {"confidence_start": 55, "confidence_continue": 30, "confidence_stop": 12,
         "word_peak_threshold": 70, "post_roll_seconds": 10,
-        "energy_weight": 0.25, "band_weight": 0.20, "entropy_weight": 0.35,
-        "zcr_weight": 0.15, "pitch_weight": 0.05, "noise_floor_db": -65},
-    # Level 3: Balanced (default) - rejects static, accepts weak-strong voice
-    3: {"confidence_start": 62, "confidence_continue": 35, "confidence_stop": 15,
-        "word_peak_threshold": 73, "post_roll_seconds": 10,
-        "energy_weight": 0.25, "band_weight": 0.20, "entropy_weight": 0.40,
-        "zcr_weight": 0.10, "pitch_weight": 0.05, "noise_floor_db": -60},
-    # Level 4: Strict - rejects static
-    4: {"confidence_start": 70, "confidence_continue": 40, "confidence_stop": 18,
+        "formant_threshold_db": 5, "min_formants": 1, "noise_floor_db": -60},
+    # Level 4: Strict - requires formant validation
+    4: {"confidence_start": 65, "confidence_continue": 40, "confidence_stop": 15,
+        "word_peak_threshold": 75, "post_roll_seconds": 10,
+        "formant_threshold_db": 7, "min_formants": 2, "noise_floor_db": -55},
+    # Level 5: Voice only - strong formant + pitch requirement
+    5: {"confidence_start": 72, "confidence_continue": 50, "confidence_stop": 25,
         "word_peak_threshold": 80, "post_roll_seconds": 10,
-        "energy_weight": 0.20, "band_weight": 0.20, "entropy_weight": 0.45,
-        "zcr_weight": 0.10, "pitch_weight": 0.05, "noise_floor_db": -55},
-    # Level 5: Voice only - maximum rejection
-    5: {"confidence_start": 75, "confidence_continue": 50, "confidence_stop": 25,
-        "word_peak_threshold": 85, "post_roll_seconds": 10,
-        "energy_weight": 0.20, "band_weight": 0.15, "entropy_weight": 0.50,
-        "zcr_weight": 0.10, "pitch_weight": 0.05, "noise_floor_db": -50},
+        "formant_threshold_db": 8, "min_formants": 2, "noise_floor_db": -50},
 }
 
 SENSITIVITY_LABELS = {
@@ -577,12 +559,10 @@ class OSINTCOMWindow(QMainWindow):
         self._audio_buffer = []
         self._peak_db = -60.0
         self._voice_detected = False
-        self._voice_history = collections.deque(maxlen=VAD_SMOOTHING_WINDOW)
         self._voice_started_at = None
         self._voice_silence_at = None
         self._silence_timer_remaining = 0
         self._sensitivity_level = 3
-        self._previous_energy_db = -60.0  # Track energy for drop-off detection
         self._webhooks = []  # List of {"nickname": str, "url": str, "enabled": bool, "role_id": str}
         self._webhook_message = "EMERGENCY ACTION MESSAGE INCOMING"
         self._frequency = ""
@@ -607,28 +587,19 @@ class OSINTCOMWindow(QMainWindow):
         self._calibration_active = False
         self._calibration_samples = []
         self._calibration_start = None
-        self._adaptive_snr_threshold = 8.0  # Lowered from 11 - Silero is primary (was 13 in v1.08.3)
-        self._adaptive_cv_min = 0.25  # Default, updated by calibration
-        self._adaptive_cv_max = 0.60  # Default, updated by calibration
         
         # Automatic periodic calibration (every 5 minutes when no voice detected)
         self._last_confirmed_voice_time = None
         self._periodic_calibration_enabled = True
         self._calibration_interval_seconds = 300
         
-        # SSB-friendly SNR gate: use rolling minimum of last 2s
-        self._snr_percentile_window = 87  # ~2 seconds of SNR samples
-        
-        # Voice confirmation timer - requires 3.0 seconds of sustained high confidence
-        # Strict pitch-based filtering: 65% confidence, 5.5dB SNR, 15pt+ pitch minimum
+        # Voice confidence tracking
         self._voice_confidence_duration = 0.0  # Cumulative seconds of high confidence
-        self._voice_confirmation_threshold = 3.0  # Seconds of voice confidence needed (3.0s minimum to filter HF noise)
         self._last_high_confidence_time = None  # Timestamp of last high confidence frame
         self._last_pitch_score = 0.0  # Store pitch score for voice-only detection
-        
-        # Signal-based VAD (no ML dependencies)
-        self._silero_model = None
-        self._silero_ready = False
+        self._hangover_remaining = 0.0  # Post-roll hangover countdown
+        self._low_confidence_frames = 0  # Track consecutive low-confidence frames
+        self._post_roll_silence_frames = 0  # Track silence during post-roll
         
         # Audio processing settings
         self._audio_settings = {
@@ -740,7 +711,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.17")
+        version_label = QLabel("v1.20")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -1216,11 +1187,16 @@ class OSINTCOMWindow(QMainWindow):
             audio_data = np.concatenate(self._calibration_samples)
             audio_data = np.clip(audio_data, -1.0, 1.0).astype(np.float32)
             
-            # Analyze noise properties
+            # Analyze noise properties — update the ACTUAL noise floor used by VAD v1.19
             rms_noise = np.sqrt(np.mean(audio_data ** 2))
-            snr_db_noise = 20 * np.log10((rms_noise + 1e-10) / (self._noise_floor_rms + 1e-10))
+            old_rms = getattr(self, '_noise_floor_rms', 0.001)
+            old_db = self._noise_floor_db
             
-            # Check modulation (CV) of noise
+            # Update noise floor (the values _detect_voice() actually uses)
+            self._noise_floor_rms = rms_noise * 0.9  # 90% of measured noise
+            self._noise_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
+            
+            # Check modulation (CV) of noise for diagnostics
             chunk_size = len(audio_data) // 10
             rms_values = []
             for i in range(10):
@@ -1235,39 +1211,13 @@ class OSINTCOMWindow(QMainWindow):
             else:
                 cv_noise = 0.0
             
-            # Adjust thresholds based on noise characteristics
-            # If noise is high energy, raise SNR gate
-            # If noise has high modulation (variable), tighten CV range
-            
-            old_snr = self._adaptive_snr_threshold
-            old_cv_min = self._adaptive_cv_min
-            old_cv_max = self._adaptive_cv_max
-            
-            # Adaptive SNR: noise SNR was X, so require human voice to be at least +4dB above that
-            new_snr = max(13.0, snr_db_noise + 4.0)  # At least 13 dB floor
-            
-            # Adaptive CV: if noise CV is high (variable), tighten CV acceptance
-            if cv_noise > 0.45:
-                new_cv_min = 0.32  # Tighten range
-                new_cv_max = 0.50
-            else:
-                new_cv_min = 0.28
-                new_cv_max = 0.55
-            
             # Log the changes
             msg = f"📊 Calibration Complete:\n\n"
-            msg += f"Noise SNR: {snr_db_noise:.1f} dB\n"
-            msg += f"Noise CV: {cv_noise:.2f}\n\n"
-            msg += f"Adjusted thresholds:\n"
-            msg += f"SNR: {old_snr:.1f} → {new_snr:.1f} dB\n"
-            msg += f"CV: {old_cv_min:.2f}-{old_cv_max:.2f} → {new_cv_min:.2f}-{new_cv_max:.2f}"
+            msg += f"Noise RMS: {rms_noise:.6f}\n"
+            msg += f"Noise Floor: {old_db:.1f} → {self._noise_floor_db:.1f} dB\n"
+            msg += f"Noise CV: {cv_noise:.2f}\n"
             
-            # Store new thresholds in VAD
-            self._adaptive_snr_threshold = new_snr
-            self._adaptive_cv_min = new_cv_min
-            self._adaptive_cv_max = new_cv_max
-            
-            self.status_bar.showMessage(f"✓ Calibrated: SNR={new_snr:.1f}dB, CV={new_cv_min:.2f}-{new_cv_max:.2f}")
+            self.status_bar.showMessage(f"✓ Calibrated: Noise floor = {self._noise_floor_db:.1f} dB")
             
             QMessageBox.information(self, "Calibration Complete", msg)
             
@@ -1341,49 +1291,16 @@ class OSINTCOMWindow(QMainWindow):
             audio_data = np.concatenate(self._calibration_samples)
             audio_data = np.clip(audio_data, -1.0, 1.0).astype(np.float32)
             
-            # Analyze noise properties
+            # Update noise floor — the values _detect_voice() actually uses
             rms_noise = np.sqrt(np.mean(audio_data ** 2))
-            snr_db_noise = 20 * np.log10((rms_noise + 1e-10) / (self._noise_floor_rms + 1e-10))
+            old_db = self._noise_floor_db
             
-            # Check modulation (CV) of noise
-            chunk_size = len(audio_data) // 10
-            rms_values = []
-            for i in range(10):
-                start = i * chunk_size
-                end = start + chunk_size if i < 9 else len(audio_data)
-                chunk_rms = np.sqrt(np.mean(audio_data[start:end] ** 2))
-                rms_values.append(chunk_rms)
-            
-            rms_mean = np.mean(rms_values)
-            if rms_mean > 1e-10:
-                cv_noise = np.std(rms_values) / rms_mean
-            else:
-                cv_noise = 0.0
-            
-            # Adjust thresholds based on noise characteristics
-            old_snr = self._adaptive_snr_threshold
-            old_cv_min = self._adaptive_cv_min
-            old_cv_max = self._adaptive_cv_max
-            
-            # Adaptive SNR: noise SNR was X, so require voice to be +4dB above it
-            new_snr = max(13.0, snr_db_noise + 4.0)
-            
-            # Adaptive CV: if noise CV is high (variable), tighten acceptance range
-            if cv_noise > 0.45:
-                new_cv_min = 0.32
-                new_cv_max = 0.50
-            else:
-                new_cv_min = 0.28
-                new_cv_max = 0.55
-            
-            # Apply new thresholds
-            self._adaptive_snr_threshold = new_snr
-            self._adaptive_cv_min = new_cv_min
-            self._adaptive_cv_max = new_cv_max
+            self._noise_floor_rms = rms_noise * 0.9
+            self._noise_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
             
             # Log silently to status bar
             self.status_bar.showMessage(
-                f"Auto-calibrated: SNR {old_snr:.1f}→{new_snr:.1f}dB, CV {old_cv_min:.2f}-{old_cv_max:.2f}→{new_cv_min:.2f}-{new_cv_max:.2f}"
+                f"Auto-calibrated: Noise floor {old_db:.1f} → {self._noise_floor_db:.1f} dB"
             )
             
         except Exception as e:
@@ -1451,24 +1368,26 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.12 Intelligent Voice Detection - Signal-Calibrated VAD.
+        """v1.19 Speech Formant Primary Detection.
         
-        4-layer detection tuned from real FlexRadio DAX SSB signal data:
-        1. SNR gate            - 25pts max
-        2. Pitch detection     - 35pts max (BEST discriminator: silence 0.10-0.20, voice 0.22+)
-        3. Spectral entropy    - 25pts max (tight upper 0.72; silence 0.63-0.66 gets ~0-8pts)
-        4. Zero-crossing rate  - 15pts max (reduced: SSB voice+silence both score 0.05-0.11)
-        Silence blocking gate  - caps at 25% if pitch=0 AND entropy<5 (carrier between words)
+        Validated on real FlexRadio IQ data - speech formants are the discriminator:
+        1. Speech Formants (40pts) - PRIMARY: 300-4000 Hz spectral peaks
+        2. SNR Gate (15pts) - Foundation threshold
+        3. Voice Band Organization (20pts) - Spectral structure 300-3000 Hz
+        4. Pitch Detection (15pts) - Fundamental frequency 85-250 Hz
+        5. Modulation (10pts) - Amplitude dynamics
         
-        Returns: 0-100 confidence where 50+ = voice
+        Key insight: Noise can have high dynamic range (11.68 dB), but speech has
+        characteristic formant peaks (F1:200-900Hz, F2:700-2200Hz, F3:1500-3500Hz)
+        that are absent in noise. Voice2 capture showed 3.5kHz formants.
+        
+        Returns: 0-100 confidence where 55+ = voice (see sensitivity preset thresholds)
         """
         if len(audio) < 512:
             return 0.0
         
         try:
             debug = self._meter_debug
-            
-            # ===== SAFETY: CLIP EXTREME AUDIO =====
             audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
             
             # ===== INITIALIZATION =====
@@ -1476,20 +1395,29 @@ class OSINTCOMWindow(QMainWindow):
                 self._noise_floor_rms = 0.001
                 self._snr_history = collections.deque(maxlen=300)
                 self._hangover_remaining = 0.0
-                self._close_threshold = 2.0  # dB SNR (very lenient during hangover, was 5.0)
-                self._open_threshold = 8.0  # dB SNR (was 11.0, Silero is now primary)
             
             # ===== LEARNING PHASE =====
             if self._learning_phase == "startup":
                 now = time.time()
                 if now - self._last_learning_time < self._noise_learning_time:
                     rms = np.sqrt(np.mean(audio ** 2))
-                    if rms < 0.01:
-                        self._noise_floor_rms = rms * 0.9
+                    # Accumulate samples for averaging (not just overwrite)
+                    if not hasattr(self, '_learning_rms_samples'):
+                        self._learning_rms_samples = []
+                    if rms < 0.1:  # Accept any reasonable signal (radio noise floor can be > 0.01)
+                        self._learning_rms_samples.append(rms)
                     return 0.0
                 else:
+                    # Average all collected samples for a robust noise floor
+                    if hasattr(self, '_learning_rms_samples') and self._learning_rms_samples:
+                        n_samples = len(self._learning_rms_samples)
+                        self._noise_floor_rms = np.median(self._learning_rms_samples) * 0.9
+                        del self._learning_rms_samples
+                    else:
+                        n_samples = 0
                     self._learning_phase = "periodic"
-                    print(f"✓ LEARNING COMPLETE: Noise floor = {20*np.log10(self._noise_floor_rms+1e-10):.1f} dB")
+                    self._noise_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
+                    print(f"✓ LEARNING COMPLETE: Noise floor = {self._noise_floor_db:.1f} dB (from {n_samples} samples)")
                     self._last_relearn_time = now
                     return 0.0
             
@@ -1499,131 +1427,116 @@ class OSINTCOMWindow(QMainWindow):
                 rms = np.sqrt(np.mean(audio ** 2))
                 if now - self._last_relearn_time > self._noise_relearn_interval and rms < 0.005:
                     self._noise_floor_rms = self._noise_floor_rms * 0.99 + rms * 0.01
+                    self._noise_floor_db = 20 * np.log10(self._noise_floor_rms + 1e-10)
                     self._last_relearn_time = now
             
-            # ===== 4-LAYER INTELLIGENT VOICE DETECTION =====
-            # Layer 1: SNR gate (foundation)
-            # Layer 2: Pitch detection (voice has fundamental frequency ~85-250Hz)
-            # Layer 3: Spectral entropy (voice organized, static chaotic)
-            # Layer 4: Zero-crossing rate (voice smooth, static choppy)
-            
+            # ===== 5-COMPONENT FORMANT-PRIMARY DETECTION =====
             confidence = 0.0
             rms = np.sqrt(np.mean(audio ** 2))
             snr_db = 20 * np.log10((rms + 1e-10) / (self._noise_floor_rms + 1e-10))
             self._snr_history.append(snr_db)
             self._last_snr_db = snr_db
             
-            if len(self._snr_history) > 10:
-                snr_percentile = np.percentile(list(self._snr_history), 20)
+            # Use recent SNR (last 5 frames ~250ms) not 15-second floor
+            recent_frames = 5
+            if len(self._snr_history) >= recent_frames:
+                recent_snr = list(self._snr_history)[-recent_frames:]
+                snr_percentile = np.median(recent_snr)
             else:
                 snr_percentile = snr_db
             
-            # ===== LAYER 1: SNR GATE =====
-            # Determine thresholds based on state (lowered for weak radio signals)
+            # ===== COMPONENT 1: SNR GATE (15 points) =====
             if self._recording:
                 snr_threshold = -2.0  # Very lenient during recording
             elif self._hangover_remaining > 0:
-                snr_threshold = 0.0  # Hangover is lenient
+                snr_threshold = 0.0  # Lenient during hangover
             else:
-                snr_threshold = 2.0  # Reject static/noise - requires 2dB SNR above noise floor
+                snr_threshold = 0.0  # Weak radio: don't gate on SNR, just score it (0dB threshold)
             
-            snr_passes = snr_percentile > snr_threshold
-            
-            # Layer 1 score: 0-25 points (gate + bonus)
-            if not snr_passes:
-                confidence = 0.0  # SNR gate fails - everything fails
-                if debug:
-                    print(f"  [FAILED SNR Gate] SNR {snr_percentile:.1f}dB < {snr_threshold:.1f}dB (Noise floor: {20*np.log10(self._noise_floor_rms+1e-10):.1f}dB, RMS: {20*np.log10(rms+1e-10):.1f}dB)")
+            # SNR scoring: 0pts at threshold, 15pts at threshold+10dB
+            if snr_percentile < snr_threshold:
+                snr_score = 0.0
+            elif snr_percentile > snr_threshold + 10.0:
+                snr_score = 15.0
             else:
-                confidence = 20.0  # Base score for passing SNR
-                if snr_percentile > snr_threshold + 3.0:
-                    confidence = 25.0  # Bonus for strong SNR
-                if debug:
-                    print(f"  [PASSED SNR Gate] SNR {snr_percentile:.1f}dB >= {snr_threshold:.1f}dB (Noise floor: {20*np.log10(self._noise_floor_rms+1e-10):.1f}dB, RMS: {20*np.log10(rms+1e-10):.1f}dB) → score: {confidence:.0f}")
+                # Linear: 0-15pts between threshold and threshold+10dB
+                snr_score = ((snr_percentile - snr_threshold) / 10.0) * 15.0
             
-            # ===== LAYER 2: PITCH DETECTION =====
-            # Voice fundamental ~85-250Hz. Best single discriminator for SSB voice.
-            # Weight: 35pts (strongest discriminator - silence pitch stays 0.10-0.20)
-            pitch_score = 0.0  # Default for silence
-            if confidence > 0:
-                pitch_score = self._detect_pitch(audio)  # Returns 0-35
-                confidence += pitch_score
-                if debug:
-                    print(f"  Layer 2 Pitch: +{pitch_score:.0f} (total: {confidence:.0f})")
-            self._last_pitch_score = pitch_score  # Store for recording gate
+            confidence += snr_score
             
-            # ===== LAYER 3: SPECTRAL ENTROPY =====
-            # Voice: organized spectrum (low entropy), Silence: flat carrier (high entropy)
-            # Weight: 25pts. Upper bound tightened to 0.72 (was 0.80) - silence 0.63-0.66
-            # was getting 14-17pts; now gets 7-10pts before blocking gate fires.
-            if confidence > 0:
-                entropy_score = self._estimate_spectral_entropy(audio)  # Returns 0-25
-                confidence += entropy_score
-                if debug:
-                    print(f"  Layer 3 Entropy: +{entropy_score:.0f} (total: {confidence:.0f})")
+            if debug:
+                print(f"  SNR Gate: +{snr_score:.0f}pts (SNR {snr_percentile:.1f}dB)")
             
-            # ===== SILENCE BLOCKING GATE =====
-            # If pitch is entirely absent AND entropy is near-flat, this is carrier
-            # noise / between-word silence, not voice. Cap confidence hard at 25%.
-            # Data: silence = pitch 0.10-0.20 (0pts) + entropy 0.63-0.66 (<5pts)
-            if confidence > 0 and pitch_score == 0.0 and entropy_score < 5.0:
-                confidence = min(confidence, 25.0)
-                if debug:
-                    print(f"  [SILENCE GATE] Pitch=0, Entropy<5 → capped at 25%")
-                return np.clip(confidence, 0.0, 100.0)
+            # ===== COMPONENT 2: SPEECH FORMANTS (40 points) - PRIMARY =====
+            formant_score, formant_count = self._score_formants(audio)
+            confidence += formant_score
             
-            # ===== LAYER 4: ZERO-CROSSING RATE =====
-            # Reduced to 15pts (was 25pts): ZCR 0.05-0.11 is present in BOTH voice and
-            # silence for SSB radio, making it unreliable as a primary discriminator.
-            if confidence > 0:
-                zcr_score = self._zero_crossing_rate_score(audio)  # Returns 0-15
-                confidence += zcr_score
-                if debug:
-                    print(f"  Layer 4 ZCR: +{zcr_score:.0f} (total: {confidence:.0f})")
+            if debug:
+                print(f"  Formants: +{formant_score:.0f}pts ({formant_count} detected)")
             
-            # ===== DATA SIGNAL DETECTION: Frequency Stability Check =====
-            # DISABLED: Initial approach too aggressive
-            # Will implement improved detection in v1.14
-            # if confidence > 25:  # Only check if likely to be non-noise
-            #     freq_stability = self._detect_frequency_stability(audio)
-            #     if freq_stability > 0.85:  # Too stable = likely data signal
-            #         confidence = max(5.0, confidence - 30.0)
+            # If formants found, confidence is likely good
+            # If no formants and low score, check other components
             
-            # ===== MODULATION CHECK: Boost/Penalty =====
-            # Natural voice has 0.25-0.60 coefficient of variation
-            if confidence > 0:
+            # ===== COMPONENT 3: VOICE BAND ORGANIZATION (20 points) =====
+            voiceband_score = self._score_voice_band(audio)
+            confidence += voiceband_score
+            
+            if debug:
+                print(f"  Voice Band: +{voiceband_score:.0f}pts")
+            
+            # ===== COMPONENT 4: PITCH DETECTION (15 points) =====
+            pitch_score = self._detect_pitch(audio) if confidence > 10 else 0.0
+            # Rescale pitch output from 0-35 to 0-15
+            pitch_score = (pitch_score / 35.0) * 15.0
+            confidence += pitch_score
+            self._last_pitch_score = pitch_score
+            
+            if debug:
+                print(f"  Pitch: +{pitch_score:.0f}pts")
+            
+            # ===== COMPONENT 5: MODULATION (10 points) =====
+            if confidence > 15:
                 chunk_size = len(audio) // 10
-                if chunk_size > 0:
+                if chunk_size > 50:
                     rms_values = []
                     for i in range(10):
                         start = i * chunk_size
                         end = start + chunk_size if i < 9 else len(audio)
-                        chunk_rms = np.sqrt(np.mean(audio[start:end] ** 2))
+                        chunk = audio[start:end]
+                        chunk_rms = np.sqrt(np.mean(chunk ** 2))
                         rms_values.append(chunk_rms)
                     
-                    rms_values = np.array(rms_values, dtype=np.float32)
-                    rms_mean = np.mean(rms_values)
+                    rms_array = np.array(rms_values, dtype=np.float32)
+                    rms_mean = np.mean(rms_array)
+                    
                     if rms_mean > 1e-10:
-                        cv = np.sqrt(np.var(rms_values)) / rms_mean
+                        cv = np.std(rms_array) / rms_mean
                     else:
                         cv = 0.0
                     
-                    if self._adaptive_cv_min < cv < self._adaptive_cv_max:
-                        confidence = min(100.0, confidence + 5.0)
-                        if debug:
-                            print(f"  Modulation: CV={cv:.2f} natural → +5 (total: {confidence:.0f})")
+                    # Score modulation: moderate CV gets bonus
+                    if cv < 0.05:
+                        mod_score = 0.0
+                    elif cv < 0.10:
+                        mod_score = (cv / 0.10) * 5.0
+                    elif cv < 0.30:
+                        mod_score = 5.0 + ((min(cv, 0.30) - 0.10) / 0.20) * 5.0
                     else:
-                        confidence = max(5.0, confidence - 5.0)
-                        if debug:
-                            print(f"  Modulation: CV={cv:.2f} unnatural → -5 (total: {confidence:.0f})")
+                        mod_score = 10.0
+                    
+                    confidence += mod_score
+                    if debug:
+                        print(f"  Modulation: +{mod_score:.0f}pts (CV={cv:.3f})")
             
             if debug:
-                print(f"[VOICE] SNR={snr_percentile:.1f}dB | Confidence={confidence:.0f}/100 | Hangover={self._hangover_remaining:.2f}s")
+                print(f"[VOICE v1.19] SNR={snr_percentile:.1f}dB | Formants={formant_count} | Confidence={confidence:.0f}/100")
             
             return np.clip(confidence, 0.0, 100.0)
             
         except Exception as e:
-            print(f"[VAD EXCEPTION] {str(e)[:100]}")
+            print(f"[VAD ERROR] {str(e)[:100]}")
+            import traceback
+            traceback.print_exc()
             return 0.0
     
     def _detect_pitch(self, audio: np.ndarray) -> float:
@@ -1680,533 +1593,120 @@ class OSINTCOMWindow(QMainWindow):
             else:
                 return (peak_strength - 0.10) / 0.35 * 35.0
         except:
-            return 2.0  # Small credit for attempting pitch detection
+            return 0.0  # No credit on error — silence is safer than false positive
     
-    def _estimate_spectral_entropy(self, audio: np.ndarray) -> float:
-        """Estimate spectral entropy - low for voice, high for static.
+    
+    def _score_formants(self, audio: np.ndarray, max_points: float = 40.0) -> tuple:
+        """Detect speech formants in 300-4000 Hz band.
         
-        Voice has organized spectrum with formants.
-        Static has relatively flat spectrum.
-        Returns: 0-25 points (0 = chaotic/noise, 25 = organized/voice)
+        Speech formants (F1-F4) are acoustic resonances visible as peaks:
+        F1: 200-900 Hz     (back of tongue position)
+        F2: 700-2200 Hz    (front of tongue position)
+        F3: 1500-3500 Hz   (lip rounding)
+        F4: 2400-4000 Hz   (rare, upper frequencies)
+        
+        Voice has 2-4 clear formant peaks.
+        Noise has no formants (smooth spectrum).
+        
+        Returns: (score_0_to_40, formant_count)
         """
         try:
             if len(audio) < 512:
-                return 0.0
+                return 0.0, 0
             
-            # Compute power spectral density via simple FFT
-            audio_work = audio - np.mean(audio)
-            # Use Hamming window to reduce spectral leakage
-            window = np.hamming(len(audio_work))
-            audio_windowed = audio_work * window
+            # FFT in formant region
+            window = np.hanning(len(audio))
+            fft_result = np.fft.rfft(audio * window)
+            freqs = np.fft.rfftfreq(len(audio), 1/self._sample_rate)
+            magnitude = np.abs(fft_result)
+            magnitude_db = 20 * np.log10(magnitude + 1e-9)
             
-            fft_data = np.fft.rfft(audio_windowed)
-            power = np.abs(fft_data) ** 2
-            power = power / (np.sum(power) + 1e-10)  # Normalize to probability distribution
+            # Extract 300-4000 Hz band
+            formant_mask = (freqs > 300) & (freqs < 4000)
+            formant_freqs = freqs[formant_mask]
+            formant_mag_db = magnitude_db[formant_mask]
             
-            # Shannon entropy: -sum(p * log(p))
-            # Low entropy = concentrated energy (voice)
-            # High entropy = spread energy (static)
-            power_clipped = np.clip(power, 1e-10, 1.0)
-            entropy = -np.sum(power_clipped * np.log(power_clipped + 1e-10))
+            if len(formant_mag_db) == 0:
+                return 0.0, 0
             
-            # Normalize by max entropy (uniform distribution)
-            max_entropy = np.log(len(power))
-            normalized_entropy = entropy / (max_entropy + 1e-10)
+            # Find peaks - formants are local maxima with prominence
+            # Use sensitivity preset's formant_threshold_db (3-8 dB above median)
+            preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
+            threshold_db = preset.get("formant_threshold_db", 5)
+            formant_floor = np.median(formant_mag_db) + threshold_db
             
-            # Calibrated from real FlexRadio SSB signal data:
-            # Silence (carrier): entropy 0.63-0.66 → should score ~0-8pts
-            # Low voice: entropy 0.55-0.66 → 0-18pts
-            # Strong voice: entropy 0.18-0.50 → 20-25pts
-            # Map: >0.72 = 0pts, <0.50 = 25pts, linear between
-            # (Was 0.80 upper - silence was incorrectly getting 14-17pts)
-            if normalized_entropy > 0.72:
-                return 0.0
-            elif normalized_entropy < 0.50:
-                return 25.0
-            else:
-                return (0.72 - normalized_entropy) / 0.22 * 25.0
-        except:
-            return 2.0  # Small credit for attempting entropy check
-    
-    def _zero_crossing_rate_score(self, audio: np.ndarray) -> float:
-        """Calculate zero-crossing rate - low for voice, high for static.
+            peaks, properties = find_peaks(
+                formant_mag_db,
+                height=formant_floor,
+                distance=max(1, int(200 / (self._sample_rate / len(audio)))),  # Min 200Hz apart
+                prominence=3.0  # Raised from 2.0 - need clear local prominence to reject noise bumps
+            )
+            
+            formant_count = len(peaks)
+            
+            # Scoring:
+            # 0 formants = 0pts (noise, silence)
+            # 1 formant = 8pts (weak voice)
+            # 2 formants = 20pts (good voice)
+            # 3 formants = 35pts (strong voice)
+            # 4+ formants = 40pts (excellent voice)
+            
+            if formant_count == 0:
+                score = 0.0
+            elif formant_count == 1:
+                score = 8.0
+            elif formant_count == 2:
+                score = 20.0
+            elif formant_count == 3:
+                score = 35.0
+            else:  # 4+
+                score = max_points
+            
+            return score, formant_count
         
-        Voice has smooth modulation (low ZCR).
-        Static has rapid fluctuations (high ZCR).
-        Reduced to 15pts max (was 25): for SSB radio, both voice and silence have
-        similar ZCR (0.05-0.11) so this layer is not a reliable primary discriminator.
-        Returns: 0-15 points (0 = high ZCR/noise, 15 = low ZCR/voice)
+        except:
+            return 0.0, 0
+    
+    def _score_voice_band(self, audio: np.ndarray, max_points: float = 20.0) -> float:
+        """Score spectral organization in 300-3000 Hz voice band.
+        
+        Voice band should have organized structure (formants, harmonics).
+        Noise has flat/uniform spectrum in this band.
+        
+        Scoring based on spectral flatness:
+        Voice: < 0.4 flatness = organized
+        Noise: > 0.6 flatness = flat/unstructured
         """
         try:
-            if len(audio) < 2:
-                return 0.0
-            
-            # Count sign changes in audio signal
-            audio_work = audio - np.mean(audio)
-            zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_work)))) / 2.0
-            zcr = zero_crossings / len(audio_work)
-            
-            # Calibrated from real FlexRadio SSB signal data:
-            # Both voice and silence score 0.05-0.11 (both would hit max 25pts).
-            # Reduced max to 15pts - provides supporting evidence only.
-            # Map: >0.30 = 0pts, <0.10 = 15pts, linear between
-            if zcr > 0.30:
-                return 0.0
-            elif zcr < 0.10:
-                return 15.0
-            else:
-                return (0.30 - zcr) / 0.20 * 15.0
-        except:
-            return 2.0  # Small credit for attempting ZCR check
-    
-    def _detect_frequency_stability(self, audio: np.ndarray) -> float:
-        """Detect frequency stability to discriminate data signals from voice.
-        
-        Voice: Dynamic pitch changes, varying formants → peak shift 0.15-0.25
-        Data (FSK/RTTY/MFSK): Fixed frequency tones → peak shift <0.10
-        
-        Returns: 0-1 score, where >0.85 indicates likely data signal (stable)
-        """
-        try:
-            # Split audio into 4 subframes to detect peak movement
-            if len(audio) < 512:
-                return 0.0
-            
-            subframe_size = len(audio) // 4
-            if subframe_size < 256:
-                return 0.0
-            
-            peak_freqs = []
-            
-            for i in range(4):
-                start = i * subframe_size
-                end = start + subframe_size if i < 3 else len(audio)
-                subframe = audio[start:end]
-                
-                # Get spectrum
-                window = np.hamming(len(subframe))
-                subframe_windowed = subframe * window
-                fft_data = np.fft.rfft(subframe_windowed)
-                power = np.abs(fft_data) ** 2
-                
-                # Find dominant peak (skip DC)
-                power[0] = 0
-                if len(power) > 0:
-                    peak_idx = np.argmax(power)
-                    freq = peak_idx * self._sample_rate / len(subframe_windowed)
-                    peak_freqs.append(freq)
-            
-            if len(peak_freqs) < 2:
-                return 0.0
-            
-            # Measure variation in peak frequencies
-            peak_freqs = np.array(peak_freqs)
-            freq_changes = np.abs(np.diff(peak_freqs))
-            
-            # Normalize by average frequency to get relative stability
-            avg_freq = np.mean(peak_freqs)
-            if avg_freq > 100:  # Skip very low frequencies
-                relative_changes = freq_changes / avg_freq
-            else:
-                relative_changes = freq_changes / 500.0  # Fallback normalization
-            
-            # Stability = 1 - average relative change
-            # High stability (data) = small changes → score 0.9+
-            # Low stability (voice) = large changes → score 0.3-0.6
-            avg_relative_change = np.mean(relative_changes)
-            stability = 1.0 - np.clip(avg_relative_change, 0, 1.0)
-            
-            return float(stability)
-        except:
-            return 0.0  # Default: uncertainty, allow normal scoring
-    
-    def _check_syllabic_modulation(self, audio: np.ndarray) -> float:
-        """Check for speech-like modulation at 3-8 Hz (syllabic rate).
-        
-        Human speech has energy modulation around syllable rate.
-        Static bursts don't have this pattern.
-        
-        Returns: 0-1 score, higher = more speech-like modulation
-        """
-        try:
-            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
-            
-            # Compute envelope (RMS over short windows)
-            window = 128  # ~3ms at 44kHz
-            envelope = []
-            for i in range(0, len(audio_safe) - window, window):
-                e = np.sqrt(np.mean(audio_safe[i:i+window] ** 2))
-                envelope.append(e)
-            
-            if len(envelope) < 10:
-                return 0.3
-            
-            envelope = np.array(envelope, dtype=np.float32)
-            
-            # FFT of envelope (looking for 3-8 Hz modulation)
-            # envelope dt ≈ 128/44000 ≈ 3ms, so Fs ≈ 333 Hz
-            try:
-                from scipy.signal import welch
-                freqs, pxx = welch(envelope, fs=len(envelope) * (self._sample_rate / len(audio_safe)))
-                
-                # Protect against NaN values
-                pxx = np.nan_to_num(pxx, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                # Find energy in 3-8 Hz band
-                mask = (freqs >= 3) & (freqs <= 8)
-                speech_band_energy = np.mean(pxx[mask]) if np.any(mask) else 0
-                
-                # Find energy in silence band (0-1 Hz and >15 Hz)
-                silence_mask = ((freqs >= 0) & (freqs <= 1)) | (freqs > 15)
-                silence_band_energy = np.mean(pxx[silence_mask]) if np.any(silence_mask) else 1
-                
-                # Speech modulation ratio
-                speech_band_energy = np.nan_to_num(speech_band_energy, nan=0.0, posinf=0.0, neginf=0.0)
-                silence_band_energy = np.nan_to_num(silence_band_energy, nan=1e-10, posinf=1.0, neginf=1e-10)
-                
-                ratio = speech_band_energy / (silence_band_energy + 1e-10)
-                ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
-                
-                return np.clip(ratio, 0, 1.0)
-            except:
-                return 0.3
-        except:
-            return 0.3
-    
-    def _check_formant_structure(self, audio: np.ndarray) -> float:
-        """Check for formant-like structure (peaks in spectrogram).
-        
-        Speech has formants (concentrated energy bands).
-        Noise has relatively flat energy distribution.
-        
-        Returns: 0-1 score, higher = more formant-like (voice-like)
-        """
-        try:
-            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
-            
-            # Compute spectrum
-            freqs, pxx = welch(audio_safe, fs=self._sample_rate, nperseg=min(512, len(audio_safe)))
-            
-            # Protect against NaN and extreme values
-            pxx = np.nan_to_num(pxx, nan=0.0, posinf=1e-10, neginf=0.0)
-            
-            # Normalize
-            pxx_max = np.max(pxx)
-            if pxx_max > 0:
-                pxx = pxx / np.max([pxx_max, 1e-10])
-            
-            # Check if energy is concentrated (voice) vs uniform (noise)
-            # Voice: peaks with valleys (kurtosis > 2)
-            # Noise: relatively flat (kurtosis ≈ 0-1)
-            
-            # Simple: count number of local maxima in spectrum
-            from scipy.signal import argrelextrema
-            peaks = argrelextrema(pxx, np.greater, order=10)[0]
-            
-            # More peaks = more structure = more voice-like
-            peak_ratio = len(peaks) / (len(pxx) / 50.0 + 1)  # Normalize by expected peaks
-            peak_ratio = np.nan_to_num(peak_ratio, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            return np.clip(peak_ratio, 0, 1.0)
-        except:
-            return 0.3
-    
-    def _calculate_confidence(self, audio: np.ndarray, preset: dict) -> float:
-        """Calculate voice confidence 0-100 from 5 weighted features.
-        
-        Features:
-        1. Energy in speech band (300-3000 Hz): 30 points
-        2. Band dominance (speech band % of total energy): 25 points
-        3. Spectral entropy (low = structured/voice, high = flat/noise): 20 points
-        4. Zero-crossing rate (voice varies, noise constant): 15 points
-        5. Pitch/periodicity (voice has pitch, noise doesn't): 10 points
-        
-        Total: 100 points
-        """
-        try:
-            confidence = 0.0
-            debug = self._meter_debug
-            
-            # Feature 1: Energy in speech band (300-3000 Hz) - 30 points
-            energy_db = self._energy_db(audio)
-            threshold_db = self._noise_floor_db + preset.get("confidence_start", 65)
-            
-            # Map energy to 0-30 points: below threshold = 0, at threshold + 6dB = 30
-            db_above_threshold = energy_db - threshold_db
-            energy_points = np.clip((db_above_threshold / 6.0) * 30, 0, 30)
-            confidence += energy_points
-            
-            # Feature 2: Band dominance - 25 points
-            band_energy = self._extract_speech_band_energy(audio)
-            total_energy_linear = np.sqrt(np.mean(audio ** 2))
-            if total_energy_linear > 1e-10:
-                band_dominance = band_energy / total_energy_linear
-                # Voice: >60% in speech band, static: <30%
-                # Map: <30% = 0 pts, 60% = 25 pts, >80% = 25 pts
-                if band_dominance < 0.30:
-                    band_points = 0
-                elif band_dominance < 0.60:
-                    band_points = (band_dominance - 0.30) / 0.30 * 25
-                else:
-                    band_points = 25
-                confidence += band_points
-            else:
-                band_points = 0
-            
-            # Feature 3: Spectral entropy (low = voice structure) - 20 points
-            flatness = self._spectral_flatness(audio)
-            # Voice: <0.4 flatness, Noise: >0.6
-            # Map: >0.6 = 0 pts, <0.4 = 20 pts, linear between
-            if flatness > 0.60:
-                entropy_points = 0
-            elif flatness < 0.40:
-                entropy_points = 20
-            else:
-                entropy_points = (0.60 - flatness) / 0.20 * 20
-            confidence += entropy_points
-            
-            # Feature 4: Zero-crossing rate (mid-range = voice) - 15 points
-            zcr = self._zero_crossing_rate(audio)
-            # Voice: 0.1-0.5, Static: >0.5
-            # Map: <0.1 = 10 pts, 0.3 = 15 pts, >0.5 = 0 pts
-            if zcr < 0.10:
-                zcr_points = 10
-            elif zcr < 0.30:
-                zcr_points = 10 + (zcr - 0.10) / 0.20 * 5
-            elif zcr < 0.50:
-                zcr_points = 15 - (zcr - 0.30) / 0.20 * 15
-            else:
-                zcr_points = 0
-            confidence += zcr_points
-            
-            # Feature 5: Pitch/periodicity (voice = periodic) - 10 points
-            pitch = self._pitch_periodicity(audio)
-            # Voice: >0.4 periodicity, Noise: <0.2
-            # Map: <0.2 = 0 pts, >0.4 = 10 pts, linear between
-            if pitch > 0.40:
-                pitch_points = 10
-            elif pitch < 0.20:
-                pitch_points = 0
-            else:
-                pitch_points = (pitch - 0.20) / 0.20 * 10
-            confidence += pitch_points
-            
-            if debug and self._learning_phase == "periodic":
-                print(f"  [Features] E:{energy_points:.0f}({energy_db:.1f}dB) B:{band_points:.0f}({band_dominance:.0%}) S:{entropy_points:.0f}({flatness:.2f}) Z:{zcr_points:.0f}({zcr:.2f}) P:{pitch_points:.0f}({pitch:.2f})")
-            
-            return np.clip(confidence, 0.0, 100.0)
-        except Exception as e:
-            print(f"Confidence calc error: {e}")
-            import traceback
-            traceback.print_exc()
-            return 0.0
-    
-    def _extract_speech_band_energy(self, audio: np.ndarray) -> float:
-        """Extract RMS energy in speech band (300-3000 Hz)."""
-        try:
-            # Apply bandpass filter
+            # Bandpass 300-3000 Hz
             sos = butter(4, [300, 3000], btype='band', fs=self._sample_rate, output='sos')
             filtered = sosfiltfilt(sos, audio)
             
-            # Return RMS energy
-            return np.sqrt(np.mean(filtered ** 2))
-        except:
-            return np.sqrt(np.mean(audio ** 2)) * 0.5  # Fallback: assume 50% in band
-    
-    def _energy_db(self, audio: np.ndarray, return_linear: bool = False) -> float:
-        """Calculate RMS energy in dB or linear domain.
-        
-        Args:
-            audio: Audio samples
-            return_linear: If True, return RMS (linear). If False, return dB.
-        
-        Returns:
-            Energy in dB (default) or RMS (if return_linear=True)
-        """
-        try:
-            rms = np.sqrt(np.mean(audio ** 2))
-            if return_linear:
-                return rms
-            else:
-                return 20 * np.log10(rms + 1e-10)
-        except:
-            return 0.0 if not return_linear else 1e-10
-    
-    def _spectral_flatness(self, audio: np.ndarray) -> float:
-        """Wiener entropy: flat=1 (white noise), structured=0 (voiced). Voice has low flatness."""
-        try:
-            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
-            freqs, pxx = welch(audio_safe, fs=self._sample_rate, nperseg=min(512, len(audio_safe)))
-            
-            # Protect against invalid values
+            # Spectral flatness
+            freqs, pxx = welch(filtered, fs=self._sample_rate, nperseg=min(512, len(filtered)))
             pxx = np.maximum(pxx, 1e-12)
-            pxx = np.nan_to_num(pxx, nan=1e-12, posinf=1.0, neginf=1e-12)
             
             geom_mean = np.exp(np.mean(np.log(pxx)))
             arith_mean = np.mean(pxx)
             
-            if np.isnan(geom_mean) or np.isnan(arith_mean) or np.isinf(arith_mean):
-                return 0.5
+            if arith_mean > 0:
+                flatness = geom_mean / arith_mean
+            else:
+                return 5.0
             
-            flatness = geom_mean / (arith_mean + 1e-12)
-            flatness = np.nan_to_num(flatness, nan=0.5, posinf=0.5, neginf=0.5)
-            
-            return np.clip(flatness, 0.0, 1.0)
+            # Scoring: structured (low flatness) to flat (high flatness)
+            # Tightened thresholds: SSB radio noise is also bandpass-shaped (not white)
+            # so noise flatness can be 0.3-0.5, voice is typically 0.1-0.3
+            if flatness > 0.50:
+                return 0.0  # Flat = noise
+            elif flatness < 0.25:
+                return max_points  # Very structured = voice
+            else:
+                # Linear between 0.25-0.50
+                return (0.50 - flatness) / 0.25 * max_points
+        
         except:
-            return 0.5
-
-    def _autocorrelation_periodicity(self, audio: np.ndarray) -> float:
-        """Autocorrelation-based periodicity detection. Voice has peaks, noise is flat."""
-        try:
-            std = np.std(audio)
-            if std < 1e-8:
-                return 0.4
-            audio_norm = (audio - np.mean(audio)) / (std + 1e-10)
-            
-            # Autocorrelation at pitch period (60-200 Hz typical for speech)
-            autocor = np.correlate(audio_norm, audio_norm, mode='full')
-            autocor = autocor[len(autocor)//2:]
-            autocor = autocor / (autocor[0] + 1e-10)
-            
-            # Search pitch range (2-18 samples @ 44kHz = ~100-400 Hz)
-            pitch_range = autocor[2:18] if len(autocor) > 18 else autocor[2:]
-            periodicity = np.max(pitch_range) if len(pitch_range) > 0 else 0.0
-            
-            return np.clip(periodicity, 0.0, 1.0)
-        except:
-            return 0.3
-
-    def _envelope_variance(self, audio: np.ndarray) -> float:
-        """Detects syllabic modulation: voice has varying envelope, static is flat.
-        Uses Hilbert transform to extract amplitude envelope."""
-        try:
-            from scipy.signal import hilbert
-            
-            # Get instantaneous amplitude via Hilbert transform
-            analytical = hilbert(audio)
-            envelope = np.abs(analytical)
-            
-            # Normalize envelope
-            env_mean = np.mean(envelope)
-            if env_mean < 1e-10:
-                return 0.0
-            
-            # Variance in normalized envelope (voice > 0.005, static < 0.001)
-            normalized_env = envelope / (env_mean + 1e-10)
-            variance = np.var(normalized_env)
-            
-            return np.clip(variance, 0.0, 1.0)
-        except:
-            return 0.005
-
-    def _harmonicity_score(self, audio: np.ndarray) -> float:
-        """Detects harmonic structure: voice has harmonics, noise is inharmonic.
-        Returns 0-1 where higher = more harmonic (voice-like)."""
-        try:
-            freqs, pxx = welch(audio, fs=self._sample_rate, nperseg=min(512, len(audio)))
-            
-            if len(pxx) < 10:
-                return 0.3
-            
-            # Find peaks in power spectrum (potential harmonics)
-            threshold = np.mean(pxx) + np.std(pxx)
-            peaks = np.where(pxx > threshold)[0]
-            
-            if len(peaks) < 2:
-                return 0.0
-            
-            # Check if peaks are spaced harmonically (multiples of fundamental)
-            peak_freqs = freqs[peaks]
-            fundamental = peak_freqs[0] if len(peak_freqs) > 0 else 100
-            
-            if fundamental < 50:
-                return 0.0
-            
-            # Count harmonics (peaks at ~2f, ~3f, ~4f, etc.)
-            harmonic_count = 0
-            for i in range(2, 5):  # Check 2nd, 3rd, 4th harmonics
-                harmonic_freq = fundamental * i
-                # Allow ±20% tolerance
-                matches = np.sum((peak_freqs >= harmonic_freq * 0.8) & 
-                                (peak_freqs <= harmonic_freq * 1.2))
-                harmonic_count += matches
-            
-            # Harmonicity: ratio of detected harmonics (0-1)
-            harmonicity = harmonic_count / 3.0  # max 3 harmonics checked
-            return np.clip(harmonicity, 0.0, 1.0)
-        except:
-            return 0.3
-
-    def _crest_factor(self, audio: np.ndarray) -> float:
-        """Peak-to-RMS ratio: voice has defined peaks, noise is flat.
-        Voice: 1.5-2.2, Static: 1.0-1.2"""
-        try:
-            rms = np.sqrt(np.mean(audio ** 2))
-            if rms < 1e-10:
-                return 0.0
-            
-            peak = np.max(np.abs(audio))
-            crest = peak / (rms + 1e-10)
-            
-            # Normalize: 1.0 = no peaks (noise), 2.5+ = strong peaks (voice)
-            # Map to 0-1: crest 1.0 -> 0.0, crest 2.5 -> 1.0
-            normalized = (crest - 1.0) / 1.5
-            return np.clip(normalized, 0.0, 1.0)
-        except:
-            return 1.0
-
-    def _zero_crossing_rate(self, audio: np.ndarray) -> float:
-        """Normalized zero-crossing rate. Voice typically 0.1-0.5; static > 0.5."""
-        try:
-            zcr = np.sum(np.abs(np.diff(np.sign(audio)))) / (2 * len(audio))
-            return np.clip(zcr, 0.0, 1.0)
-        except:
-            return 0.3
-    
-    def _pitch_periodicity(self, audio: np.ndarray) -> float:
-        """Enhanced periodicity detection for weak/noisy signals like USB radio.
-        Autocorrelation-based: voice has peaks, noise doesn't. Returns 0-1 (higher = more voice-like)."""
-        try:
-            audio_safe = np.clip(audio, -1.0, 1.0).astype(np.float32)
-            
-            # Normalize (handle very quiet signals)
-            std = np.std(audio_safe)
-            if std < 1e-8:
-                # Signal too quiet, be lenient
-                return 0.4
-            
-            audio_norm = (audio_safe - np.mean(audio_safe)) / (std + 1e-10)
-            
-            # Autocorrelation with wider search for weak signals
-            max_lag = min(len(audio_norm) // 2, 512)
-            autocor = np.correlate(audio_norm, audio_norm, mode='full')
-            autocor = autocor[len(autocor)//2:]
-            
-            # Protect against division by zero
-            autocor_norm = np.abs(autocor[0]) + 1e-10
-            if np.isnan(autocor_norm) or np.isinf(autocor_norm):
-                return 0.35
-            
-            autocor = autocor / autocor_norm
-            
-            # Wider pitch range for robustness: 50-400 Hz (1-18 samples @ 44kHz)
-            # Also check 400-800 Hz for harmonics
-            pitch_range_1 = autocor[1:18] if len(autocor) > 18 else autocor[1:]
-            pitch_range_2 = autocor[18:36] if len(autocor) > 36 else []
-            
-            peak1 = np.max(pitch_range_1) if len(pitch_range_1) > 0 else 0.0
-            peak2 = np.max(pitch_range_2) if len(pitch_range_2) > 0 else 0.0
-            
-            # Handle NaN peaks
-            peak1 = np.nan_to_num(peak1, nan=0.0, posinf=0.0, neginf=0.0)
-            peak2 = np.nan_to_num(peak2, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            # Combine peaks with bias toward fundamental frequency
-            periodicity = max(peak1 * 0.7 + peak2 * 0.3, peak1)
-            
-            return np.clip(periodicity, 0.0, 1.0)
-        except:
-            return 0.35
+            return 0.0  # Defensive: no credit on error
 
     # ============================================================================
     # Audio Processing Methods
@@ -2508,18 +2008,16 @@ class OSINTCOMWindow(QMainWindow):
             # (lowered from 3.5s to handle natural speech pauses in SSB radio)
             # Lowered confidence thresholds for weak radio signals
             
-            # Determine thresholds based on state: stricter during hangover
+            # Use preset thresholds instead of hardcoded values
             if self._recording and self._hangover_remaining > 0:
-                # During post-roll/hangover: Be VERY strict (60%) to avoid false positives
-                # Reject noise and only accept clear voice to prevent extending recording
-                threshold_for_accumulate = 60
+                # During post-roll/hangover: stricter to avoid extending on noise
+                threshold_for_accumulate = word_peak_threshold  # Uses preset (60-80)
             elif self._recording:
-                # During normal recording: Use moderate bar (52%) to detect when voice ENDS
-                threshold_for_accumulate = 52
+                # During normal recording: use continue threshold from preset
+                threshold_for_accumulate = continue_threshold  # Uses preset (15-50)
             else:
-                # Before recording: Use high bar (55%) to ignore static/noise (<52%) and marginal signals
-                # Only clear voice signals above noise floor trigger voice confirmation accumulation
-                threshold_for_accumulate = 35  # Only accumulate voice > 35% (rejects static/noise, captures weak voice)
+                # Before recording: use start threshold from preset
+                threshold_for_accumulate = start_threshold  # Uses preset (40-72)
             
             # Voice confidence accumulator - tracks total voice time for upload validation
             if confidence > threshold_for_accumulate:
@@ -2593,13 +2091,14 @@ class OSINTCOMWindow(QMainWindow):
             voice_detected = bool(voice_detected)  # Ensure native Python bool
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
-            # START RECORDING - only on sustained high-confidence voice with pitch
-            # Require confidence > 65% AND SNR > 5.5dB AND pitch >= 15pts to filter HF noise
+            # START RECORDING - use sensitivity preset thresholds
             snr_now = getattr(self, '_last_snr_db', 0.0)
             pitch_score = getattr(self, '_last_pitch_score', 0.0)
-            if not self._recording and confidence > 65.0 and snr_now > 5.5 and pitch_score >= 15.0:
+            
+            # Use preset start threshold (40-72 depending on sensitivity level)
+            if not self._recording and confidence >= start_threshold:
                 if self._meter_debug:
-                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100, SNR={snr_now:.1f}dB immediately")
+                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100 >= {start_threshold}%, SNR={snr_now:.1f}dB, Pitch={pitch_score:.0f}pts")
                 self._start_recording()
                 self.status_bar.showMessage(f"Recording started | Voice detected (SNR={snr_display:.1f}dB)")
             
@@ -2625,7 +2124,6 @@ class OSINTCOMWindow(QMainWindow):
 
 
     def _start_recording(self):
-        self._recording = True
         self._voice_started_at = time.time()
         self._voice_silence_at = None
         self._silence_timer_remaining = 0
@@ -2641,19 +2139,16 @@ class OSINTCOMWindow(QMainWindow):
         # Clear hangover tracking flags for fresh hangover window
         if hasattr(self, '_hangover_started'):
             delattr(self, '_hangover_started')
-        if hasattr(self, '_post_roll_silence_frames'):
-            self._post_roll_silence_frames = 0
-        
-        # Reset post-roll silence counter for new recording
         self._post_roll_silence_frames = 0
         
-        # Copy pre-roll buffer to recording buffer (must happen atomically)
+        # Copy pre-roll buffer to recording buffer atomically under BOTH locks
+        # to prevent the audio callback from writing between the two operations
         with self._lock:
-            self._audio_buffer = list(self._ring_buffer)
+            with self._audio_buffer_lock:
+                self._audio_buffer = list(self._ring_buffer)
         
-        with self._audio_buffer_lock:
-            # Keep audio buffer; callback will append to it
-            pass
+        # Set recording flag AFTER buffer is initialized, so callback appends correctly
+        self._recording = True
         
         self._signals.status.emit(
             f"Recording... | VAD: Voice | Pre-roll: {len(self._audio_buffer) * BLOCK_SIZE / self._sample_rate:.1f}s"
@@ -2738,105 +2233,6 @@ class OSINTCOMWindow(QMainWindow):
                 self._signals.status.emit(f"Uploaded to {len(enabled_webhooks)} webhook(s) | Frequency: {self._frequency}")
         except Exception as e:
             self._signals.error.emit(f"Encoding/upload failed: {e}")
-
-    def _validate_recording_for_upload(self, audio: np.ndarray) -> tuple:
-        """Final validation gate before uploading recording to Discord.
-        
-        Uses basic audio quality checks (not full VAD re-analysis):
-        1. Average energy level (must have content)
-        2. Syllabic modulation (speech-like envelope variation)
-        3. Spectral profile consistency (voice vs noise)
-        4. Peak-to-noise ratio
-        
-        Does NOT re-run full _detect_voice (avoids VAD state issues).
-        If recording triggered and lasted 3.0s+, it's likely real voice.
-        
-        Returns: (validation_score: 0-1, message: str)
-        """
-        try:
-            audio = np.clip(audio, -1.0, 1.0).astype(np.float32)
-            
-            # ===== CHECK 1: Sufficient Energy =====
-            rms_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
-            
-            # Voice recordings should be at least -45 dB (very sensitive for weak HF SSB signals)
-            if rms_db < -45.0:
-                return 0.0, f"Insufficient energy ({rms_db:.1f} dB)"
-            
-            energy_score = min(1.0, (rms_db + 20.0) / 10.0)  # Full score at -10 dB
-            if self._meter_debug:
-                print(f"  [VAL] Energy: {rms_db:.1f} dB → {energy_score:.0%}")
-            
-            # ===== CHECK 2: Syllabic Modulation =====
-            modulation_score = self._check_upload_syllabic_modulation(audio)
-            if modulation_score < 0.02:  # Only reject if completely flat (static noise with zero variation)
-                return 0.0, f"No syllabic modulation ({modulation_score:.2f})"
-            
-            if self._meter_debug:
-                print(f"  [VAL] Syllabic modulation: {modulation_score:.0%}")
-            
-            # ===== CHECK 3: Spectral Consistency =====
-            spectral_score = self._check_upload_spectral_consistency(audio)
-            if self._meter_debug:
-                print(f"  [VAL] Spectral consistency: {spectral_score:.0%}")
-            
-            # ===== CHECK 4: Peak-to-Noise Ratio =====
-            # Simple check: signal should have defined peaks (voice), not flat (noise)
-            peak = np.max(np.abs(audio))
-            rms = np.sqrt(np.mean(audio ** 2))
-            
-            if rms < 1e-10:
-                return 0.0, "No audio signal"
-            
-            crest = peak / (rms + 1e-10)
-            
-            # Voice has crest factor ~2.0-2.5, noise ~1.0-1.5
-            if crest < 1.3:
-                peak_score = 0.0
-            elif crest > 2.0:
-                peak_score = 1.0
-            else:
-                peak_score = (crest - 1.3) / 0.7  # Linear between 1.3 and 2.0
-            
-            if self._meter_debug:
-                print(f"  [VAL] Crest factor: {crest:.2f} → {peak_score:.0%}")
-            
-            # ===== COMBINED SCORE =====
-            # Weight: Energy (30%), Modulation (35%), Spectral (20%), Peak (15%)
-            final_score = (
-                energy_score * 0.40 +
-                modulation_score * 0.20 +
-                spectral_score * 0.20 +
-                peak_score * 0.20
-            )
-            
-            if self._meter_debug:
-                print(f"  [VAL FINAL] {final_score:.0%} (E:{energy_score:.0%} M:{modulation_score:.0%} S:{spectral_score:.0%} P:{peak_score:.0%})")
-            
-            return final_score, (f"Validation passed ({final_score:.0%})" if final_score >= 0.15 else f"Validation insufficient ({final_score:.0%})")
-        
-        except Exception as e:
-            return 0.0, f"Validation error: {str(e)[:40]}"
-
-    def _calculate_chunk_snr(self, chunk: np.ndarray) -> float:
-        """Calculate SNR of a single audio chunk."""
-        try:
-            # Apply bandpass filter to isolate speech band
-            sos = butter(4, [300, 3000], btype='band', fs=self._sample_rate, output='sos')
-            filtered = sosfiltfilt(sos, chunk)
-            
-            # Signal = filtered (voice band), Noise = full - filtered (out of band)
-            signal_rms = np.sqrt(np.mean(filtered ** 2))
-            noise = chunk - filtered
-            noise_rms = np.sqrt(np.mean(noise ** 2))
-            
-            if noise_rms < 1e-10:
-                return 20.0
-            
-            snr_db = 20 * np.log10((signal_rms + 1e-10) / (noise_rms + 1e-10))
-            return np.clip(snr_db, -20.0, 30.0)
-        except:
-            return 0.0
 
     def _check_upload_syllabic_modulation(self, audio: np.ndarray) -> float:
         """Check for speech-like syllabic modulation in recording.
