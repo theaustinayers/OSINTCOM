@@ -37,7 +37,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QComboBox, QLabel, QFileDialog, QDialog, QLineEdit,
     QGroupBox, QStatusBar, QSlider, QTextEdit, QDialogButtonBox, QMessageBox, QCheckBox,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QStackedWidget
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QPainter, QColor, QLinearGradient, QFontDatabase
@@ -550,8 +550,15 @@ class OSINTCOMWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OSINTCOM")
-        self.setMinimumSize(700, 620)
+        self.setMinimumSize(350, 150)  # Allow resizing down to compact size
         self.setFont(QFont("Segoe UI", 10))
+        
+        # Compact mode tracking
+        self._compact_mode = False
+        self._normal_size = (900, 800)
+        self._last_compact_size = (350, 200)
+        self._normal_widget = None
+        self._compact_widget = None
         
         # Set window icon
         icon_path = os.path.join(os.path.dirname(__file__), "icon.ico")
@@ -733,7 +740,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.13")
+        version_label = QLabel("v1.15")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -743,17 +750,46 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(self.ticker)
 
         # HFGCS Frequencies
-        self.hfgcs_frequencies = [4724.0, 6739.0, 8992.0, 11175.0, 13200.0, 15016.0, 18046.0]
         freq_group = QGroupBox("HFGCS Frequencies")
-        freq_layout = QHBoxLayout(freq_group)
+        freq_layout = QVBoxLayout(freq_group)
         self.freq_buttons = []
-        for freq in self.hfgcs_frequencies:
+        
+        # Main HFGCS frequencies (big 4)
+        main_frequencies = [4724.0, 8992.0, 11175.0, 15016.0]
+        main_freq_layout = QHBoxLayout()
+        for freq in main_frequencies:
             btn = QPushButton(f"{freq:.0f} kHz")
             btn.setCheckable(True)
-            btn.setMinimumWidth(90)
+            btn.setMinimumWidth(110)
+            btn.setMinimumHeight(40)
             btn.clicked.connect(lambda checked, f=freq: self._on_freq_selected(f))
-            freq_layout.addWidget(btn)
+            main_freq_layout.addWidget(btn)
             self.freq_buttons.append(btn)
+        freq_layout.addLayout(main_freq_layout)
+        
+        # Charlie frequencies (smaller buttons)
+        charlie_freqs = {
+            "Charlie Alpha": 6691.0,
+            "Charlie Bravo": 11187.0,
+            "Charlie Charlie": 17892.0,
+            "Charlie Delta": 3038.0,
+            "Charlie Echo": 9031.0,
+            "Charlie Foxtrot": 4703.0,
+            "Charlie Golf": 8974.0,
+            "Charlie Hotel": 11264.5,
+        }
+        charlie_freq_layout = QHBoxLayout()
+        for label, freq in charlie_freqs.items():
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setMinimumWidth(95)
+            btn.clicked.connect(lambda checked, f=freq: self._on_freq_selected(f))
+            charlie_freq_layout.addWidget(btn)
+            self.freq_buttons.append(btn)
+        freq_layout.addLayout(charlie_freq_layout)
+        
+        # Keep reference to all frequencies for consistency
+        self.hfgcs_frequencies = main_frequencies + list(charlie_freqs.values())
         layout.addWidget(freq_group)
 
         # Audio Interface
@@ -834,12 +870,15 @@ class OSINTCOMWindow(QMainWindow):
         self.save_btn.clicked.connect(self._save_config)
         self.calibrate_btn = QPushButton("Calibrate Noise")
         self.calibrate_btn.clicked.connect(self._on_calibrate_noise)
+        self.shrink_btn = QPushButton("↓ Shrink")
+        self.shrink_btn.clicked.connect(lambda: self._switch_to_compact(remember_size=True))
         controls_layout.addWidget(self.start_btn)
         controls_layout.addWidget(self.stop_btn)
         controls_layout.addWidget(self.file_btn)
         controls_layout.addWidget(self.audio_settings_btn)
         controls_layout.addWidget(self.save_btn)
         controls_layout.addWidget(self.calibrate_btn)
+        controls_layout.addWidget(self.shrink_btn)
         layout.addWidget(controls_group)
 
         # Status Bar
@@ -847,7 +886,21 @@ class OSINTCOMWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready | VAD: Idle | Recording: Stopped | Pre-roll: 5s")
 
-        self.setCentralWidget(central)
+        # Store normal widget
+        self._normal_widget = central
+        
+        # Build compact widget upfront
+        if self._compact_widget is None:
+            self._compact_widget = self._build_compact_widget()
+        
+        # Create a stacked widget to manage both views safely
+        self.stacked_widget = QStackedWidget()
+        self.stacked_widget.addWidget(self._normal_widget)      # Index 0 = normal
+        self.stacked_widget.addWidget(self._compact_widget)      # Index 1 = compact
+        self.stacked_widget.setCurrentIndex(0)                   # Start with normal
+        
+        # Set stacked widget as central widget
+        self.setCentralWidget(self.stacked_widget)
 
     def _connect_signals(self):
         self._signals.level.connect(self._on_level)
@@ -855,6 +908,145 @@ class OSINTCOMWindow(QMainWindow):
         self._signals.status.connect(self._on_status)
         self._signals.error.connect(self._on_error)
         self._signals.recording.connect(self._on_recording)
+
+    def _build_compact_widget(self) -> QWidget:
+        """Build minimal compact monitoring widget"""
+        compact = QWidget()
+        layout = QVBoxLayout(compact)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+        
+        # Frequency display
+        freq_label = QLabel("Frequency:")
+        freq_label.setStyleSheet("font-weight: bold; color: #e0e0e0;")
+        self.compact_freq_display = QLabel(self._frequency or "None")
+        self.compact_freq_display.setStyleSheet("font-size: 16px; font-weight: bold; color: #3d6b1f;")
+        freq_row = QHBoxLayout()
+        freq_row.addWidget(freq_label)
+        freq_row.addWidget(self.compact_freq_display)
+        freq_row.addStretch()
+        layout.addLayout(freq_row)
+        
+        # VAD Status with color indicator
+        vad_row = QHBoxLayout()
+        vad_label = QLabel("Voice:")
+        vad_label.setStyleSheet("font-weight: bold; color: #e0e0e0;")
+        self.compact_vad_indicator = QLabel("● STATIC")
+        self.compact_vad_indicator.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff4444;")
+        vad_row.addWidget(vad_label)
+        vad_row.addWidget(self.compact_vad_indicator)
+        vad_row.addStretch()
+        layout.addLayout(vad_row)
+        
+        # Status text
+        self.compact_status = QLabel("Idle...")
+        self.compact_status.setStyleSheet("color: #aaa; font-size: 9px;")
+        layout.addWidget(self.compact_status)
+        
+        # Control buttons - only Expand in compact mode
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        self.compact_expand_btn = QPushButton("↑ Expand")
+        self.compact_expand_btn.setMaximumWidth(80)
+        self.compact_expand_btn.clicked.connect(self._switch_to_normal)
+        button_layout.addWidget(self.compact_expand_btn)
+        
+        layout.addLayout(button_layout)
+        
+        return compact
+
+    def _switch_to_compact(self, remember_size=False):
+        """Switch to compact monitoring mode"""
+        if self._compact_mode:
+            return
+        
+        try:
+            # Store normal size before switching
+            if remember_size:
+                self._last_compact_size = (self.width(), self.height())
+            
+            self._compact_mode = True
+            
+            # Switch using stacked widget
+            self.stacked_widget.setCurrentIndex(1)
+            self.update()
+            
+            # Set compact window size with bounds check
+            w = max(350, min(600, self._last_compact_size[0]))
+            h = max(150, min(400, self._last_compact_size[1]))
+            self.resize(w, h)
+        except Exception as e:
+            print(f"[ERROR] _switch_to_compact: {e}")
+
+    def _switch_to_normal(self):
+        """Switch back to normal full UI mode"""
+        if not self._compact_mode:
+            return
+        
+        try:
+            self._compact_mode = False
+            
+            # Switch using stacked widget
+            self.stacked_widget.setCurrentIndex(0)
+            self.update()
+            
+            # Restore normal window size with safe bounds
+            w = max(700, min(1400, self._normal_size[0]))
+            h = max(620, min(1000, self._normal_size[1]))
+            self.resize(w, h)
+        except Exception as e:
+            print(f"[ERROR] _switch_to_normal: {e}")
+
+    def _update_compact_display(self):
+        """Update compact widget with current status"""
+        if self._compact_widget is None:
+            return
+        
+        # Always update labels (they'll be visible when in compact mode)
+        # Convert frequency to proper format if it's a string representation of a float
+        try:
+            freq_val = float(self._frequency) if self._frequency else None
+            freq_display = f"{freq_val:.0f}" if freq_val else "None"
+        except (ValueError, TypeError):
+            freq_display = str(self._frequency) if self._frequency else "None"
+        
+        self.compact_freq_display.setText(freq_display)
+        
+        # Update VAD indicator based on voice_label
+        if hasattr(self, 'voice_label'):
+            is_voice = "voice" in self.voice_label.text().lower()
+            if is_voice:
+                self.compact_vad_indicator.setText("● VOICE")
+                self.compact_vad_indicator.setStyleSheet("font-size: 14px; font-weight: bold; color: #00dd00;")
+            else:
+                self.compact_vad_indicator.setText("● STATIC")
+                self.compact_vad_indicator.setStyleSheet("font-size: 14px; font-weight: bold; color: #ff4444;")
+        
+        # Update status from status bar
+        if self.status_bar:
+            status_text = self.status_bar.currentMessage()
+            # Truncate long status
+            if len(status_text) > 45:
+                status_text = status_text[:42] + "..."
+            self.compact_status.setText(status_text)
+
+    def resizeEvent(self, event):
+        """Detect window resize and switch to compact mode if needed"""
+        super().resizeEvent(event)
+        
+        # Only process if we've initialized
+        if not hasattr(self, '_compact_mode'):
+            return
+        
+        current_width = self.width()
+        
+        # Threshold: switch to compact if width < 600
+        if not self._compact_mode and current_width < 600:
+            self._switch_to_compact()
+        # Switch back to normal if width >= 680 (hysteresis to avoid flickering)
+        elif self._compact_mode and current_width >= 680:
+            self._switch_to_normal()
 
     def _init_timer(self):
         self._meter_timer = QTimer(self)
@@ -901,6 +1093,7 @@ class OSINTCOMWindow(QMainWindow):
     def _on_freq_selected(self, freq):
         self._frequency = str(freq)
         self.freq_display.setText(f"{freq:.0f} kHz")
+        self._update_compact_display()
         self._save_config()  # Auto-save frequency
 
     def _on_sensitivity_changed(self, value):
@@ -1332,7 +1525,7 @@ class OSINTCOMWindow(QMainWindow):
             elif self._hangover_remaining > 0:
                 snr_threshold = 0.0  # Hangover is lenient
             else:
-                snr_threshold = 0.5  # LOWERED from 3.0 - HF radio signals are very weak
+                snr_threshold = 2.0  # Reject static/noise - requires 2dB SNR above noise floor
             
             snr_passes = snr_percentile > snr_threshold
             
@@ -2326,7 +2519,7 @@ class OSINTCOMWindow(QMainWindow):
             else:
                 # Before recording: Use high bar (55%) to ignore static/noise (<52%) and marginal signals
                 # Only clear voice signals above noise floor trigger voice confirmation accumulation
-                threshold_for_accumulate = 55
+                threshold_for_accumulate = 35  # Only accumulate voice > 35% (rejects static/noise, captures weak voice)
             
             # Voice confidence accumulator - tracks total voice time for upload validation
             if confidence > threshold_for_accumulate:
@@ -2500,25 +2693,26 @@ class OSINTCOMWindow(QMainWindow):
 
     def _encode_and_upload(self, audio_data: np.ndarray, voice_duration: float = 0.0):
         try:
-            # VOICE VALIDATION: Strict filtering - sustained voice >= 3.0s required
-            # Enforces 3.0s minimum duration + 65% confidence + 5.5dB SNR + 15pt pitch
-            if voice_duration < 3.0:
-                self._signals.status.emit(f"Filtered: Insufficient voice duration ({voice_duration:.1f}s < 3.0s) - Not uploading")
+            # VOICE VALIDATION: Minimum 0.5s of detected voice required
+            # Radio/EAM transmissions can be brief but valid if they passed VAD's 3.0s threshold
+            if voice_duration < 0.5:
+                self._signals.status.emit(f"Filtered: Insufficient voice duration ({voice_duration:.1f}s < 0.5s) - Not uploading")
                 if self._meter_debug:
-                    print(f"[UPLOAD FILTERED] Voice duration {voice_duration:.1f}s (< 3.0s) - Rejecting")
+                    print(f"[UPLOAD FILTERED] Voice duration {voice_duration:.1f}s (< 0.5s) - Rejecting")
                 return
             
             # PRE-UPLOAD VALIDATION: Final voice verification
-            # Uses strict multi-factor analysis to prevent uploading noise/static
+            # Uses basic audio quality checks (VAD already passed 3.0s requirement)
             validation_score, validation_msg = self._validate_recording_for_upload(audio_data)
-            if validation_score < 0.65:  # Must pass 65% upload quality threshold
-                self._signals.status.emit(f"Filtered: Recording failed upload validation ({validation_score:.0%}) - {validation_msg[:50]}")
+            if validation_score < 0.08:  # Only reject truly broken audio (0.08 is very permissive)
+                reason = f"Quality score too low ({validation_score:.0%})" if validation_msg.startswith("Recording") else validation_msg
+                self._signals.status.emit(f"Filtered: Recording failed validation - {reason[:50]}")
                 if self._meter_debug:
                     print(f"[UPLOAD VALIDATION FAILED] Score: {validation_score:.0%} - {validation_msg}")
                 return
             
             if self._meter_debug:
-                print(f"[UPLOAD VALIDATION PASSED] Score: {validation_score:.0%}")
+                print(f"[UPLOAD VALIDATION PASSED] Score: {validation_score:.0%} - {validation_msg}")
             
             # Normalize audio
             max_val = np.max(np.abs(audio_data))
@@ -2564,8 +2758,8 @@ class OSINTCOMWindow(QMainWindow):
             # ===== CHECK 1: Sufficient Energy =====
             rms_db = 20 * np.log10(np.sqrt(np.mean(audio ** 2)) + 1e-10)
             
-            # Voice recordings should be at least -20 dB (relative to 0dB peak)
-            if rms_db < -35.0:
+            # Voice recordings should be at least -45 dB (very sensitive for weak HF SSB signals)
+            if rms_db < -45.0:
                 return 0.0, f"Insufficient energy ({rms_db:.1f} dB)"
             
             energy_score = min(1.0, (rms_db + 20.0) / 10.0)  # Full score at -10 dB
@@ -2574,7 +2768,7 @@ class OSINTCOMWindow(QMainWindow):
             
             # ===== CHECK 2: Syllabic Modulation =====
             modulation_score = self._check_upload_syllabic_modulation(audio)
-            if modulation_score < 0.20:  # LOWERED from 0.25 - be more lenient
+            if modulation_score < 0.02:  # Only reject if completely flat (static noise with zero variation)
                 return 0.0, f"No syllabic modulation ({modulation_score:.2f})"
             
             if self._meter_debug:
@@ -2609,16 +2803,16 @@ class OSINTCOMWindow(QMainWindow):
             # ===== COMBINED SCORE =====
             # Weight: Energy (30%), Modulation (35%), Spectral (20%), Peak (15%)
             final_score = (
-                energy_score * 0.30 +
-                modulation_score * 0.35 +
+                energy_score * 0.40 +
+                modulation_score * 0.20 +
                 spectral_score * 0.20 +
-                peak_score * 0.15
+                peak_score * 0.20
             )
             
             if self._meter_debug:
                 print(f"  [VAL FINAL] {final_score:.0%} (E:{energy_score:.0%} M:{modulation_score:.0%} S:{spectral_score:.0%} P:{peak_score:.0%})")
             
-            return final_score, "Recording passed validation"
+            return final_score, (f"Validation passed ({final_score:.0%})" if final_score >= 0.15 else f"Validation insufficient ({final_score:.0%})")
         
         except Exception as e:
             return 0.0, f"Validation error: {str(e)[:40]}"
@@ -2818,6 +3012,7 @@ class OSINTCOMWindow(QMainWindow):
         else:
             self.voice_label.setText("static")
             self.voice_label.setStyleSheet("color: red; font-weight: bold; font-size: 12px;")
+        self._update_compact_display()
 
     def _on_recording(self, is_recording):
         """Handle recording state change - control ticker animation."""
@@ -2828,6 +3023,7 @@ class OSINTCOMWindow(QMainWindow):
 
     def _on_status(self, msg):
         self.status_bar.showMessage(msg)
+        self._update_compact_display()
 
     def _on_error(self, msg):
         QMessageBox.critical(self, "Error", msg)
