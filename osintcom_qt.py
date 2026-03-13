@@ -47,7 +47,7 @@ BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
 MIN_RECORDING_DURATION = 1.5
 
-# Formant-Primary VAD v1.20 — Sensitivity presets
+# Formant-Primary VAD v1.21 — Sensitivity presets
 # Scores voice 0-100: Formants(40) + VoiceBand(20) + SNR(15) + Pitch(15) + Modulation(10)
 SENSITIVITY_PRESETS = {
     # Level 1: Maximum sensitivity - Speech formant primary detection (v1.19)
@@ -711,7 +711,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.20")
+        version_label = QLabel("v1.21")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -1469,16 +1469,22 @@ class OSINTCOMWindow(QMainWindow):
             
             # ===== COMPONENT 2: SPEECH FORMANTS (40 points) - PRIMARY =====
             formant_score, formant_count = self._score_formants(audio)
-            confidence += formant_score
             
             if debug:
-                print(f"  Formants: +{formant_score:.0f}pts ({formant_count} detected)")
-            
-            # If formants found, confidence is likely good
-            # If no formants and low score, check other components
+                print(f"  Formants: +{formant_score:.0f}pts ({formant_count} clusters)")
             
             # ===== COMPONENT 3: VOICE BAND ORGANIZATION (20 points) =====
             voiceband_score = self._score_voice_band(audio)
+            
+            # --- FLAT-SPECTRUM FORMANT PENALTY ---
+            # If voice band is flat (noise-like), penalize formant score by 60%.
+            # Rationale: broadband noise CAN produce peaks with 6 dB prominence by
+            # chance, but a flat voice band means no organized spectral structure.
+            # Real voice always has some spectral structure in this band.
+            if voiceband_score == 0.0:
+                formant_score *= 0.4
+            
+            confidence += formant_score
             confidence += voiceband_score
             
             if debug:
@@ -1514,22 +1520,26 @@ class OSINTCOMWindow(QMainWindow):
                     else:
                         cv = 0.0
                     
-                    # Score modulation: moderate CV gets bonus
+                    # Score modulation: CV in speech syllable range (0.15-0.50) gets bonus.
+                    # v1.21: Cap at CV=0.50 — very high CV (>0.60) is noise bursts, not speech.
+                    # Speech syllables: CV 0.15-0.50. Broadband noise bursts: CV 0.60-1.5+
                     if cv < 0.05:
                         mod_score = 0.0
-                    elif cv < 0.10:
-                        mod_score = (cv / 0.10) * 5.0
-                    elif cv < 0.30:
-                        mod_score = 5.0 + ((min(cv, 0.30) - 0.10) / 0.20) * 5.0
+                    elif cv < 0.15:
+                        mod_score = (cv / 0.15) * 4.0
+                    elif cv < 0.50:
+                        mod_score = 4.0 + ((cv - 0.15) / 0.35) * 6.0  # Ramps 4→10 pts
+                    elif cv < 0.70:
+                        mod_score = 10.0 - ((cv - 0.50) / 0.20) * 5.0  # Ramps 10→5 pts
                     else:
-                        mod_score = 10.0
+                        mod_score = 5.0 - min(5.0, ((cv - 0.70) / 0.30) * 5.0)  # Ramps 5→0
                     
                     confidence += mod_score
                     if debug:
                         print(f"  Modulation: +{mod_score:.0f}pts (CV={cv:.3f})")
             
             if debug:
-                print(f"[VOICE v1.19] SNR={snr_percentile:.1f}dB | Formants={formant_count} | Confidence={confidence:.0f}/100")
+                print(f"[VOICE v1.21] SNR={snr_percentile:.1f}dB | Clusters={formant_count} | Confidence={confidence:.0f}/100")
             
             return np.clip(confidence, 0.0, 100.0)
             
@@ -1605,10 +1615,14 @@ class OSINTCOMWindow(QMainWindow):
         F3: 1500-3500 Hz   (lip rounding)
         F4: 2400-4000 Hz   (rare, upper frequencies)
         
-        Voice has 2-4 clear formant peaks.
-        Noise has no formants (smooth spectrum).
+        Voice has 2-4 WELL-SEPARATED formant clusters (400+ Hz apart).
+        Noise has random scattered peaks with no consistent spacing.
         
-        Returns: (score_0_to_40, formant_count)
+        Key fix v1.21: Cluster deduplication — merge peaks within 300 Hz into one
+        cluster before scoring. Prevents noise bumps producing inflated formant count.
+        Also requires 2+ clusters to span >= 400 Hz (real inter-formant spacing).
+        
+        Returns: (score_0_to_40, cluster_count)
         """
         try:
             if len(audio) < 512:
@@ -1629,8 +1643,8 @@ class OSINTCOMWindow(QMainWindow):
             if len(formant_mag_db) == 0:
                 return 0.0, 0
             
-            # Find peaks - formants are local maxima with prominence
-            # Use sensitivity preset's formant_threshold_db (3-8 dB above median)
+            # Find peaks - raised prominence to 6 dB (was 3.0)
+            # High prominence rejects random noise bumps that only rise 2-4 dB above local floor
             preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
             threshold_db = preset.get("formant_threshold_db", 5)
             formant_floor = np.median(formant_mag_db) + threshold_db
@@ -1638,31 +1652,61 @@ class OSINTCOMWindow(QMainWindow):
             peaks, properties = find_peaks(
                 formant_mag_db,
                 height=formant_floor,
-                distance=max(1, int(200 / (self._sample_rate / len(audio)))),  # Min 200Hz apart
-                prominence=3.0  # Raised from 2.0 - need clear local prominence to reject noise bumps
+                distance=max(1, int(150 / (self._sample_rate / len(audio)))),  # Min 150 Hz apart
+                prominence=6.0  # Raised from 3.0 — rejects random noise bumps
             )
             
-            formant_count = len(peaks)
+            if len(peaks) == 0:
+                return 0.0, 0
+            
+            # --- CLUSTER DEDUPLICATION ---
+            # Merge peaks within 300 Hz of each other into one cluster.
+            # Speech formants are separated by 700-1500 Hz; peaks closer than 300 Hz
+            # are just the same formant resonance and should count as one.
+            peak_freqs = formant_freqs[peaks]
+            peak_freqs_sorted = np.sort(peak_freqs)
+            
+            clusters = []
+            current_cluster = [peak_freqs_sorted[0]]
+            for freq in peak_freqs_sorted[1:]:
+                if freq - current_cluster[-1] < 300.0:  # Same cluster
+                    current_cluster.append(freq)
+                else:  # New cluster
+                    clusters.append(current_cluster)
+                    current_cluster = [freq]
+            clusters.append(current_cluster)
+            
+            cluster_count = len(clusters)
+            
+            # --- FORMANT SPREAD GATE ---
+            # For 2+ clusters, require minimum total span of 400 Hz.
+            # Real speech F1-F2 gap is always > 400 Hz; noise clusters can be
+            # tightly grouped even after deduplication.
+            if cluster_count >= 2:
+                cluster_centers = [np.mean(c) for c in clusters]
+                total_span = max(cluster_centers) - min(cluster_centers)
+                if total_span < 400.0:
+                    # Clusters are too close together — treat as single formant
+                    cluster_count = 1
             
             # Scoring:
-            # 0 formants = 0pts (noise, silence)
-            # 1 formant = 8pts (weak voice)
-            # 2 formants = 20pts (good voice)
-            # 3 formants = 35pts (strong voice)
-            # 4+ formants = 40pts (excellent voice)
-            
-            if formant_count == 0:
+            # 0 clusters = 0pts (noise, silence)
+            # 1 cluster  = 10pts (one formant — possible voice or single-tone noise)
+            # 2 clusters = 22pts (two well-separated formants — good voice)
+            # 3 clusters = 36pts (strong voice)
+            # 4+ clusters = 40pts (excellent voice)
+            if cluster_count == 0:
                 score = 0.0
-            elif formant_count == 1:
-                score = 8.0
-            elif formant_count == 2:
-                score = 20.0
-            elif formant_count == 3:
-                score = 35.0
+            elif cluster_count == 1:
+                score = 10.0
+            elif cluster_count == 2:
+                score = 22.0
+            elif cluster_count == 3:
+                score = 36.0
             else:  # 4+
                 score = max_points
             
-            return score, formant_count
+            return score, cluster_count
         
         except:
             return 0.0, 0
