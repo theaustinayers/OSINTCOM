@@ -63,31 +63,31 @@ VAD_STOP_CONFIDENCE = 20  # Stop recording threshold
 # Scores voice 0-100 based on: energy, band dominance, spectral entropy, ZCR, pitch
 # Detects word peaks and uses 10-second post-roll from last word
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches faintest voices
-    1: {"confidence_start": 46, "confidence_continue": 21, "confidence_stop": 9,
+    # Level 1: Maximum sensitivity - catches faintest voices, accepts some noise
+    1: {"confidence_start": 48, "confidence_continue": 20, "confidence_stop": 8,
         "word_peak_threshold": 66, "post_roll_seconds": 10,
-        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -68},
-    # Level 2: Very sensitive - good for weak radio
-    2: {"confidence_start": 50, "confidence_continue": 23, "confidence_stop": 10,
+        "energy_weight": 0.25, "band_weight": 0.20, "entropy_weight": 0.35,
+        "zcr_weight": 0.15, "pitch_weight": 0.05, "noise_floor_db": -68},
+    # Level 2: Very sensitive - good for weak radio, some noise accepted
+    2: {"confidence_start": 55, "confidence_continue": 28, "confidence_stop": 12,
         "word_peak_threshold": 70, "post_roll_seconds": 10,
-        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -65},
-    # Level 3: Balanced (default)
-    3: {"confidence_start": 53, "confidence_continue": 24, "confidence_stop": 11,
+        "energy_weight": 0.25, "band_weight": 0.20, "entropy_weight": 0.35,
+        "zcr_weight": 0.15, "pitch_weight": 0.05, "noise_floor_db": -65},
+    # Level 3: Balanced (default) - rejects static, accepts weak-strong voice
+    3: {"confidence_start": 62, "confidence_continue": 35, "confidence_stop": 15,
         "word_peak_threshold": 73, "post_roll_seconds": 10,
-        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -60},
+        "energy_weight": 0.25, "band_weight": 0.20, "entropy_weight": 0.40,
+        "zcr_weight": 0.10, "pitch_weight": 0.05, "noise_floor_db": -60},
     # Level 4: Strict - rejects static
-    4: {"confidence_start": 60, "confidence_continue": 27, "confidence_stop": 12,
+    4: {"confidence_start": 70, "confidence_continue": 40, "confidence_stop": 18,
         "word_peak_threshold": 80, "post_roll_seconds": 10,
-        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -55},
+        "energy_weight": 0.20, "band_weight": 0.20, "entropy_weight": 0.45,
+        "zcr_weight": 0.10, "pitch_weight": 0.05, "noise_floor_db": -55},
     # Level 5: Voice only - maximum rejection
-    5: {"confidence_start": 65, "confidence_continue": 29, "confidence_stop": 13,
+    5: {"confidence_start": 75, "confidence_continue": 50, "confidence_stop": 25,
         "word_peak_threshold": 85, "post_roll_seconds": 10,
-        "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -50},
+        "energy_weight": 0.20, "band_weight": 0.15, "entropy_weight": 0.50,
+        "zcr_weight": 0.10, "pitch_weight": 0.05, "noise_floor_db": -50},
 }
 
 SENSITIVITY_LABELS = {
@@ -740,7 +740,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.16")
+        version_label = QLabel("v1.17")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
