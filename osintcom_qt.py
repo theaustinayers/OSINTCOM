@@ -47,29 +47,34 @@ BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
 MIN_RECORDING_DURATION = 1.5
 
-# Formant-Primary VAD v1.21 — Sensitivity presets
+# Formant-Primary VAD v1.22 — Sensitivity presets
 # Scores voice 0-100: Formants(40) + VoiceBand(20) + SNR(15) + Pitch(15) + Modulation(10)
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - Speech formant primary detection (v1.19)
+    # Level 1: Maximum sensitivity - catches very weak stations, may pass some noise
     1: {"confidence_start": 40, "confidence_continue": 15, "confidence_stop": 5,
         "word_peak_threshold": 60, "post_roll_seconds": 10,
-        "formant_threshold_db": 3, "min_formants": 1, "noise_floor_db": -68},
+        "formant_threshold_db": 3, "formant_prominence_db": 3.5,
+        "flat_penalty_factor": 0.65, "min_formants": 1, "noise_floor_db": -68},
     # Level 2: Very sensitive - good for weak radio SSB/USB
     2: {"confidence_start": 48, "confidence_continue": 20, "confidence_stop": 8,
         "word_peak_threshold": 65, "post_roll_seconds": 10,
-        "formant_threshold_db": 5, "min_formants": 1, "noise_floor_db": -65},
-    # Level 3: Balanced (default) - formant-focused, reliable on weak stations
+        "formant_threshold_db": 4, "formant_prominence_db": 4.5,
+        "flat_penalty_factor": 0.55, "min_formants": 1, "noise_floor_db": -65},
+    # Level 3: Balanced (default) - good rejection with reasonable sensitivity
     3: {"confidence_start": 55, "confidence_continue": 30, "confidence_stop": 12,
         "word_peak_threshold": 70, "post_roll_seconds": 10,
-        "formant_threshold_db": 5, "min_formants": 1, "noise_floor_db": -60},
-    # Level 4: Strict - requires formant validation
+        "formant_threshold_db": 5, "formant_prominence_db": 6.0,
+        "flat_penalty_factor": 0.40, "min_formants": 1, "noise_floor_db": -60},
+    # Level 4: Strict - requires strong formant validation
     4: {"confidence_start": 65, "confidence_continue": 40, "confidence_stop": 15,
         "word_peak_threshold": 75, "post_roll_seconds": 10,
-        "formant_threshold_db": 7, "min_formants": 2, "noise_floor_db": -55},
-    # Level 5: Voice only - strong formant + pitch requirement
+        "formant_threshold_db": 7, "formant_prominence_db": 7.5,
+        "flat_penalty_factor": 0.25, "min_formants": 2, "noise_floor_db": -55},
+    # Level 5: Voice only - strong formant + pitch requirement, minimum noise
     5: {"confidence_start": 72, "confidence_continue": 50, "confidence_stop": 25,
         "word_peak_threshold": 80, "post_roll_seconds": 10,
-        "formant_threshold_db": 8, "min_formants": 2, "noise_floor_db": -50},
+        "formant_threshold_db": 8, "formant_prominence_db": 9.0,
+        "flat_penalty_factor": 0.15, "min_formants": 2, "noise_floor_db": -50},
 }
 
 SENSITIVITY_LABELS = {
@@ -711,7 +716,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.21")
+        version_label = QLabel("v1.22")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -1477,12 +1482,13 @@ class OSINTCOMWindow(QMainWindow):
             voiceband_score = self._score_voice_band(audio)
             
             # --- FLAT-SPECTRUM FORMANT PENALTY ---
-            # If voice band is flat (noise-like), penalize formant score by 60%.
-            # Rationale: broadband noise CAN produce peaks with 6 dB prominence by
-            # chance, but a flat voice band means no organized spectral structure.
-            # Real voice always has some spectral structure in this band.
+            # If voice band is flat (noise-like), penalize formant score.
+            # Penalty factor is sensitivity-driven: level 1 = 0.65x (lenient for weak voice)
+            # level 5 = 0.15x (strict, near-zero for any noise that sneaks through).
             if voiceband_score == 0.0:
-                formant_score *= 0.4
+                preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
+                flat_penalty = preset.get("flat_penalty_factor", 0.40)
+                formant_score *= flat_penalty
             
             confidence += formant_score
             confidence += voiceband_score
@@ -1643,17 +1649,19 @@ class OSINTCOMWindow(QMainWindow):
             if len(formant_mag_db) == 0:
                 return 0.0, 0
             
-            # Find peaks - raised prominence to 6 dB (was 3.0)
-            # High prominence rejects random noise bumps that only rise 2-4 dB above local floor
+            # Find peaks - raised prominence to be sensitivity-dependent (v1.22)
+            # Level 1-2: lower prominence to catch weak voice formants in noise
+            # Level 4-5: higher prominence to tightly reject noise bumps
             preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
             threshold_db = preset.get("formant_threshold_db", 5)
+            prominence_db = preset.get("formant_prominence_db", 6.0)
             formant_floor = np.median(formant_mag_db) + threshold_db
             
             peaks, properties = find_peaks(
                 formant_mag_db,
                 height=formant_floor,
                 distance=max(1, int(150 / (self._sample_rate / len(audio)))),  # Min 150 Hz apart
-                prominence=6.0  # Raised from 3.0 — rejects random noise bumps
+                prominence=prominence_db  # Sensitivity-driven: 3.5 (L1) to 9.0 (L5)
             )
             
             if len(peaks) == 0:
