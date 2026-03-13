@@ -2693,26 +2693,12 @@ class OSINTCOMWindow(QMainWindow):
 
     def _encode_and_upload(self, audio_data: np.ndarray, voice_duration: float = 0.0):
         try:
-            # VOICE VALIDATION: Minimum 0.5s of detected voice required
-            # Radio/EAM transmissions can be brief but valid if they passed VAD's 3.0s threshold
-            if voice_duration < 0.5:
-                self._signals.status.emit(f"Filtered: Insufficient voice duration ({voice_duration:.1f}s < 0.5s) - Not uploading")
-                if self._meter_debug:
-                    print(f"[UPLOAD FILTERED] Voice duration {voice_duration:.1f}s (< 0.5s) - Rejecting")
-                return
-            
-            # PRE-UPLOAD VALIDATION: Final voice verification
-            # Uses basic audio quality checks (VAD already passed 3.0s requirement)
-            validation_score, validation_msg = self._validate_recording_for_upload(audio_data)
-            if validation_score < 0.08:  # Only reject truly broken audio (0.08 is very permissive)
-                reason = f"Quality score too low ({validation_score:.0%})" if validation_msg.startswith("Recording") else validation_msg
-                self._signals.status.emit(f"Filtered: Recording failed validation - {reason[:50]}")
-                if self._meter_debug:
-                    print(f"[UPLOAD VALIDATION FAILED] Score: {validation_score:.0%} - {validation_msg}")
-                return
+            # VOICE VALIDATION SKIP: VAD already confirmed 3.0s of voice activity
+            # Secondary validation removed - it was overly restrictive for radio signals
+            # If recording passed VAD's stringent 3.0s confirmation, it's legitimate
             
             if self._meter_debug:
-                print(f"[UPLOAD VALIDATION PASSED] Score: {validation_score:.0%} - {validation_msg}")
+                print(f"[UPLOAD APPROVED] Recording passed VAD (duration: {voice_duration:.1f}s) - Proceeding to upload")
             
             # Normalize audio
             max_val = np.max(np.abs(audio_data))
