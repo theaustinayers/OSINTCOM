@@ -47,7 +47,7 @@ BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
 MIN_RECORDING_DURATION = 1.5
 
-# Formant-Primary VAD v1.24 — Sensitivity presets
+# Formant-Primary VAD v1.25 — Sensitivity presets
 # Scores voice 0-100: Formants(40) + VoiceBand(20) + SNR(15) + Pitch(15) + Modulation(10)
 SENSITIVITY_PRESETS = {
     # Level 1: Maximum sensitivity - catches very weak stations, may pass some noise
@@ -716,7 +716,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.24")
+        version_label = QLabel("v1.25")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -1378,7 +1378,7 @@ class OSINTCOMWindow(QMainWindow):
                 self._audio_buffer.append(audio_chunk)
 
     def _detect_voice(self, audio: np.ndarray) -> float:
-        """v1.19 Speech Formant Primary Detection.
+        """v1.25 Speech Formant Primary Detection.
         
         Validated on real FlexRadio IQ data - speech formants are the discriminator:
         1. Speech Formants (40pts) - PRIMARY: 300-4000 Hz spectral peaks
@@ -1484,7 +1484,6 @@ class OSINTCOMWindow(QMainWindow):
             
             # ===== COMPONENT 2: SPEECH FORMANTS (40 points) - PRIMARY =====
             # Accumulate into rolling buffer (~185ms at 48kHz) before scoring.
-            # Longer window reduces noise variance so random peaks don't exceed threshold.
             self._formant_buffer.append(audio)
             formant_audio = np.concatenate(list(self._formant_buffer))
             formant_score, formant_count = self._score_formants(formant_audio)
@@ -1496,19 +1495,43 @@ class OSINTCOMWindow(QMainWindow):
             voiceband_score = self._score_voice_band(audio)
             
             # --- FLAT-SPECTRUM FORMANT PENALTY ---
-            # If voice band is flat (noise-like), penalize formant score.
-            # Penalty factor is sensitivity-driven: level 1 = 0.65x (lenient for weak voice)
-            # level 5 = 0.15x (strict, near-zero for any noise that sneaks through).
             if voiceband_score == 0.0:
                 preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
                 flat_penalty = preset.get("flat_penalty_factor", 0.40)
                 formant_score *= flat_penalty
             
+            # ===== v1.25 SNR GATE ON SPECTRAL SCORES =====
+            # HF background noise always has spectral structure (peaks from QRM,
+            # multi-path, adjacent stations) — so formants and voiceband ALWAYS
+            # score full marks for noise, making them useless without this gate.
+            #
+            # Fix: scale both scores by how far the signal is above the calibrated
+            # noise floor.  SNR=0dB (calibrated noise level) → scale=0, no credit.
+            # SNR≥6dB → full credit.  Ramps linearly between 0-6 dB.
+            #
+            # Sensitivity-aware ramp top:
+            #   L1: 3 dB (very weak voice just needs to be slightly above noise)
+            #   L2: 4 dB
+            #   L3: 5 dB  (default)
+            #   L4: 6 dB
+            #   L5: 8 dB  (strict: needs clearly above-noise signal)
+            snr_ramp_tops = {1: 3.0, 2: 4.0, 3: 5.0, 4: 6.0, 5: 8.0}
+            snr_ramp_top = snr_ramp_tops.get(self._sensitivity_level, 5.0)
+            if snr_percentile <= 0.0:
+                snr_spectral_gate = 0.0
+            elif snr_percentile >= snr_ramp_top:
+                snr_spectral_gate = 1.0
+            else:
+                snr_spectral_gate = snr_percentile / snr_ramp_top
+            
+            formant_score  *= snr_spectral_gate
+            voiceband_score *= snr_spectral_gate
+            
             confidence += formant_score
             confidence += voiceband_score
             
             if debug:
-                print(f"  Voice Band: +{voiceband_score:.0f}pts")
+                print(f"  Voice Band: +{voiceband_score:.0f}pts  SNR gate: {snr_spectral_gate:.2f}")
             
             # ===== COMPONENT 4: PITCH DETECTION (15 points) =====
             pitch_score = self._detect_pitch(audio) if confidence > 10 else 0.0
@@ -1559,7 +1582,7 @@ class OSINTCOMWindow(QMainWindow):
                         print(f"  Modulation: +{mod_score:.0f}pts (CV={cv:.3f})")
             
             if debug:
-                print(f"[VOICE v1.24] SNR={snr_percentile:.1f}dB | Clusters={formant_count} | Confidence={confidence:.0f}/100")
+                print(f"[VOICE v1.25] SNR={snr_percentile:.1f}dB | Clusters={formant_count} | gate={snr_spectral_gate:.2f} | Confidence={confidence:.0f}/100")
             
             return np.clip(confidence, 0.0, 100.0)
             
