@@ -67,27 +67,27 @@ SENSITIVITY_PRESETS = {
     1: {"confidence_start": 46, "confidence_continue": 21, "confidence_stop": 9,
         "word_peak_threshold": 66, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10},
+        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -68},
     # Level 2: Very sensitive - good for weak radio
     2: {"confidence_start": 50, "confidence_continue": 23, "confidence_stop": 10,
         "word_peak_threshold": 70, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10},
+        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -65},
     # Level 3: Balanced (default)
     3: {"confidence_start": 53, "confidence_continue": 24, "confidence_stop": 11,
         "word_peak_threshold": 73, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10},
+        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -60},
     # Level 4: Strict - rejects static
     4: {"confidence_start": 60, "confidence_continue": 27, "confidence_stop": 12,
         "word_peak_threshold": 80, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10},
+        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -55},
     # Level 5: Voice only - maximum rejection
     5: {"confidence_start": 65, "confidence_continue": 29, "confidence_stop": 13,
         "word_peak_threshold": 85, "post_roll_seconds": 10,
         "energy_weight": 0.30, "band_weight": 0.25, "entropy_weight": 0.20,
-        "zcr_weight": 0.15, "pitch_weight": 0.10},
+        "zcr_weight": 0.15, "pitch_weight": 0.10, "noise_floor_db": -50},
 }
 
 SENSITIVITY_LABELS = {
@@ -740,7 +740,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.15")
+        version_label = QLabel("v1.16")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -2694,21 +2694,26 @@ class OSINTCOMWindow(QMainWindow):
     def _encode_and_upload(self, audio_data: np.ndarray, voice_duration: float = 0.0):
         try:
             # MINIMAL ARTIFACT FILTERING: Only reject obvious silence
+            # Noise floor threshold tied to sensitivity setting (1-5)
             # Short bursts (static, sweeps, etc.) are allowed through
             # Better to upload an artifact than miss real voice
             
             rms_db = 20 * np.log10(np.sqrt(np.mean(audio_data ** 2)) + 1e-10)
             
-            # REJECT: Only if essentially silent (RMS too low)
-            if rms_db < -60.0:
-                self._signals.status.emit(f"Filtered: Signal too quiet ({rms_db:.1f} dB)")
+            # Get noise floor threshold from current sensitivity preset
+            preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
+            noise_floor = preset.get("noise_floor_db", -60.0)
+            
+            # REJECT: Only if signal is below sensitivity-based noise floor
+            if rms_db < noise_floor:
+                self._signals.status.emit(f"Filtered: Signal too quiet ({rms_db:.1f} dB < {noise_floor:.1f} dB threshold)")
                 if self._meter_debug:
-                    print(f"[ARTIFACT REJECTED] Too quiet: {rms_db:.1f} dB")
+                    print(f"[ARTIFACT REJECTED] Too quiet: {rms_db:.1f} dB (threshold: {noise_floor:.1f} dB)")
                 return
             
             # Otherwise: Upload even if it's a brief burst
             if self._meter_debug:
-                print(f"[UPLOAD APPROVED] Brief burst recorded (RMS:{rms_db:.1f}dB) - Uploading")
+                print(f"[UPLOAD APPROVED] Brief burst recorded (RMS:{rms_db:.1f}dB, threshold:{noise_floor:.1f}dB) - Uploading")
             
             # Normalize audio
             max_val = np.max(np.abs(audio_data))
