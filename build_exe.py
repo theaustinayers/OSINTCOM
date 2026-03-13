@@ -26,22 +26,35 @@ def build():
         os.path.join(project_dir, "osintcom_qt.py"),
         "--name=OSINTCOM",
         f"--icon={icon_path}",
-        "--onefile",
+        "--onedir",  # onedir uses far less RAM than onefile during build
         "--windowed",
         "--add-data=icon.ico:.",
         "--hidden-import=sounddevice",
-        "--hidden-import=numpy",
-        "--hidden-import=scipy",
+        "--hidden-import=scipy.signal",
+        "--hidden-import=scipy.signal.windows",
         "--hidden-import=scipy.io.wavfile",
+        "--hidden-import=numpy",
         "--hidden-import=requests",
         "--hidden-import=PyQt5",
         "--hidden-import=PyQt5.QtWidgets",
         "--hidden-import=PyQt5.QtCore",
         "--hidden-import=PyQt5.QtGui",
         "--collect-all=sounddevice",
-        "--collect-all=scipy",
-        "--collect-all=numpy",
         "--distpath=dist",
+        "--exclude-module=torch",
+        "--exclude-module=torchvision",
+        "--exclude-module=torchaudio",
+        "--exclude-module=tensorflow",
+        "--exclude-module=tensorboard",
+        "--exclude-module=dask",
+        "--exclude-module=matplotlib",
+        "--exclude-module=PIL",
+        "--exclude-module=IPython",
+        "--exclude-module=jupyter",
+        "--exclude-module=pytest",
+        "--exclude-module=pandas",
+        "--exclude-module=sklearn",
+        "--exclude-module=cv2",
     ]
     
     # Optional: Add noisereduce if available
@@ -59,7 +72,7 @@ def build():
     
     try:
         PyInstaller.__main__.run(args)
-        exe_path = os.path.join(project_dir, "dist", "OSINTCOM.exe")
+        exe_path = os.path.join(project_dir, "dist", "OSINTCOM", "OSINTCOM.exe")
         if os.path.exists(exe_path):
             size_mb = os.path.getsize(exe_path) / (1024 * 1024)
             print("\n" + "=" * 60)
