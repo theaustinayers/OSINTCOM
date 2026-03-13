@@ -47,7 +47,7 @@ BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
 MIN_RECORDING_DURATION = 1.5
 
-# Formant-Primary VAD v1.22 — Sensitivity presets
+# Formant-Primary VAD v1.24 — Sensitivity presets
 # Scores voice 0-100: Formants(40) + VoiceBand(20) + SNR(15) + Pitch(15) + Modulation(10)
 SENSITIVITY_PRESETS = {
     # Level 1: Maximum sensitivity - catches very weak stations, may pass some noise
@@ -557,7 +557,7 @@ class OSINTCOMWindow(QMainWindow):
         self._running = False
         self._recording = False
         self._stream = None
-        self._sample_rate = 44100
+        self._sample_rate = 48000  # Default matches FlexRadio DAX IQ; overwritten from device at runtime
         self._lock = threading.Lock()
         self._ring_buffer = collections.deque(maxlen=int(PRE_ROLL_SECONDS * self._sample_rate / BLOCK_SIZE))
         self._audio_buffer_lock = threading.Lock()
@@ -716,7 +716,7 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.22")
+        version_label = QLabel("v1.24")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
         layout.addWidget(version_label)
@@ -1333,12 +1333,17 @@ class OSINTCOMWindow(QMainWindow):
             device_idx = device_data if device_data is not None else None
             device_info = sd.query_devices(device_idx)
             self._sample_rate = int(device_info['default_samplerate'])
+            # Recreate ring buffer with correct size for this device's sample rate
+            with self._lock:
+                self._ring_buffer = collections.deque(
+                    maxlen=int(PRE_ROLL_SECONDS * self._sample_rate / BLOCK_SIZE)
+                )
             self._stream = sd.InputStream(
                 device=device_idx, channels=CHANNELS, samplerate=self._sample_rate,
                 blocksize=BLOCK_SIZE, callback=self._audio_callback
             )
             self._stream.start()
-            self._signals.status.emit(f"Listening on {device_info['name']}")
+            self._signals.status.emit(f"Listening on {device_info['name']} @ {self._sample_rate} Hz")
         except Exception as e:
             self._signals.error.emit(f"Stream start failed: {e}")
             self._running = False
@@ -1400,6 +1405,11 @@ class OSINTCOMWindow(QMainWindow):
                 self._noise_floor_rms = 0.001
                 self._snr_history = collections.deque(maxlen=300)
                 self._hangover_remaining = 0.0
+            if not hasattr(self, '_formant_buffer'):
+                # Accumulate last 4 blocks (~185ms @ 2048/44100Hz) for formant analysis.
+                # Longer window averages out noise variance (std 3.9 dB) while
+                # preserving stable voice formants that persist across frames.
+                self._formant_buffer = collections.deque(maxlen=4)
             
             # ===== LEARNING PHASE =====
             if self._learning_phase == "startup":
@@ -1473,7 +1483,11 @@ class OSINTCOMWindow(QMainWindow):
                 print(f"  SNR Gate: +{snr_score:.0f}pts (SNR {snr_percentile:.1f}dB)")
             
             # ===== COMPONENT 2: SPEECH FORMANTS (40 points) - PRIMARY =====
-            formant_score, formant_count = self._score_formants(audio)
+            # Accumulate into rolling buffer (~185ms at 48kHz) before scoring.
+            # Longer window reduces noise variance so random peaks don't exceed threshold.
+            self._formant_buffer.append(audio)
+            formant_audio = np.concatenate(list(self._formant_buffer))
+            formant_score, formant_count = self._score_formants(formant_audio)
             
             if debug:
                 print(f"  Formants: +{formant_score:.0f}pts ({formant_count} clusters)")
@@ -1545,7 +1559,7 @@ class OSINTCOMWindow(QMainWindow):
                         print(f"  Modulation: +{mod_score:.0f}pts (CV={cv:.3f})")
             
             if debug:
-                print(f"[VOICE v1.21] SNR={snr_percentile:.1f}dB | Clusters={formant_count} | Confidence={confidence:.0f}/100")
+                print(f"[VOICE v1.24] SNR={snr_percentile:.1f}dB | Clusters={formant_count} | Confidence={confidence:.0f}/100")
             
             return np.clip(confidence, 0.0, 100.0)
             
@@ -1621,18 +1635,38 @@ class OSINTCOMWindow(QMainWindow):
         F3: 1500-3500 Hz   (lip rounding)
         F4: 2400-4000 Hz   (rare, upper frequencies)
         
-        Voice has 2-4 WELL-SEPARATED formant clusters (400+ Hz apart).
-        Noise has random scattered peaks with no consistent spacing.
-        
-        Key fix v1.21: Cluster deduplication — merge peaks within 300 Hz into one
-        cluster before scoring. Prevents noise bumps producing inflated formant count.
-        Also requires 2+ clusters to span >= 400 Hz (real inter-formant spacing).
+        v1.24 changes:
+        - Receives a longer audio window (up to 4 blocks ~185ms) for reliable peaks
+        - In-band flatness pre-gate: if the 300-4000 Hz region itself is flat
+          (flatness > 0.72), return 0 immediately — real voice always has structure
+        - Cluster tightness-aware scoring for single-cluster weak voice
         
         Returns: (score_0_to_40, cluster_count)
         """
         try:
             if len(audio) < 512:
                 return 0.0, 0
+            
+            # --- IN-BAND FLATNESS PRE-GATE ---
+            # Compute spectral flatness of ONLY the 300-4000 Hz band.
+            # Noise in this band is still broadband-flat (flatness 0.75-0.90).
+            # Real voice has prominent formant peaks (flatness 0.15-0.55).
+            # Gate: if band flatness > 0.72, this is almost certainly noise.
+            # (Sensitivity-aware: level 1 allows up to 0.80 for very weak voice)
+            preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
+            flatness_gates = {1: 0.80, 2: 0.76, 3: 0.72, 4: 0.68, 5: 0.62}
+            flatness_gate = flatness_gates.get(self._sensitivity_level, 0.72)
+            
+            try:
+                sos_bp = butter(4, [300, 4000], btype='band', fs=self._sample_rate, output='sos')
+                band_audio = sosfiltfilt(sos_bp, audio)
+                _, pxx = welch(band_audio, fs=self._sample_rate, nperseg=min(512, len(band_audio)))
+                pxx = np.maximum(pxx, 1e-12)
+                in_band_flatness = np.exp(np.mean(np.log(pxx))) / np.mean(pxx)
+                if in_band_flatness > flatness_gate:
+                    return 0.0, 0  # Band is flat — noise, not voice
+            except:
+                pass  # If band flatness check fails, continue with peak analysis
             
             # FFT in formant region
             window = np.hanning(len(audio))
@@ -1688,31 +1722,41 @@ class OSINTCOMWindow(QMainWindow):
             
             # --- FORMANT SPREAD GATE ---
             # For 2+ clusters, require minimum total span of 400 Hz.
-            # Real speech F1-F2 gap is always > 400 Hz; noise clusters can be
-            # tightly grouped even after deduplication.
+            # Real speech F1-F2 gap is always > 400 Hz; noise clusters that survive
+            # deduplication but are still close together get merged back to 1.
             if cluster_count >= 2:
                 cluster_centers = [np.mean(c) for c in clusters]
                 total_span = max(cluster_centers) - min(cluster_centers)
                 if total_span < 400.0:
-                    # Clusters are too close together — treat as single formant
+                    # Too close — collapse to single cluster
                     cluster_count = 1
             
-            # Scoring:
-            # 0 clusters = 0pts (noise, silence)
-            # 1 cluster  = 10pts (one formant — possible voice or single-tone noise)
-            # 2 clusters = 22pts (two well-separated formants — good voice)
-            # 3 clusters = 36pts (strong voice)
-            # 4+ clusters = 40pts (excellent voice)
-            if cluster_count == 0:
-                score = 0.0
-            elif cluster_count == 1:
-                score = 10.0
+            # --- SINGLE-CLUSTER TIGHTNESS SCORING ---
+            # Key insight from real FlexRadio IQ captures:
+            #   Extremely weak voice: all peaks within 129 Hz (tight single formant)
+            #   Strong voice 2:       all peaks within 217 Hz
+            #   Pure noise:           peaks scattered over 17870 Hz
+            # A single tight cluster is a REAL formant, not noise.
+            # Score based on bandwidth of the tightest cluster.
+            if cluster_count == 1:
+                cluster_bw = max(clusters[0]) - min(clusters[0]) if len(clusters[0]) > 1 else 0.0
+                if cluster_bw <= 150.0:
+                    # Extremely tight — characteristic of weak SSB voice (e.g. 129 Hz)
+                    score = 22.0
+                elif cluster_bw <= 250.0:
+                    # Tight — typical of single formant voice (e.g. 217 Hz)
+                    score = 17.0
+                else:
+                    # Loose single cluster — marginal
+                    score = 10.0
             elif cluster_count == 2:
                 score = 22.0
             elif cluster_count == 3:
                 score = 36.0
-            else:  # 4+
+            elif cluster_count >= 4:
                 score = max_points
+            else:
+                score = 0.0
             
             return score, cluster_count
         
