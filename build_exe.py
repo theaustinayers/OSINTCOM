@@ -26,7 +26,7 @@ def build():
         os.path.join(project_dir, "osintcom_qt.py"),
         "--name=OSINTCOM",
         f"--icon={icon_path}",
-        "--onedir",  # onedir uses far less RAM than onefile during build
+        "--onefile",  # single self-contained executable
         "--noconfirm",  # don't prompt when overwriting dist output folder
         "--windowed",
         "--add-data=icon.ico:.",
@@ -73,7 +73,10 @@ def build():
     
     try:
         PyInstaller.__main__.run(args)
-        exe_path = os.path.join(project_dir, "dist", "OSINTCOM", "OSINTCOM.exe")
+        exe_path = os.path.join(project_dir, "dist", "OSINTCOM.exe")
+        if not os.path.exists(exe_path):
+            # Fallback: onedir layout
+            exe_path = os.path.join(project_dir, "dist", "OSINTCOM", "OSINTCOM.exe")
         if os.path.exists(exe_path):
             size_mb = os.path.getsize(exe_path) / (1024 * 1024)
             print("\n" + "=" * 60)

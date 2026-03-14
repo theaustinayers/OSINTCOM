@@ -88,12 +88,15 @@ SENSITIVITY_PRESETS = {
         "formant_threshold_db": 4, "formant_prominence_db": 4.5,
         "flat_penalty_factor": 0.55, "min_formants": 1, "noise_floor_db": -65},
     # Level 3: Balanced (default) — data-validated for HFGCS frequencies.
-    # 11175 noise: max run=4 @ >=50%, ratio=10.9%. 8992 noise (new): max run=6, worst-ratio=27.7%.
-    # Gates: run=7 (noise max=6 → 1 chunk margin), ratio=0.30 (noise worst=27.7% → 2.3% margin).
-    # Voice min word run at 21.5ch/s = 8+ chunks → passes both gates comfortably.
+    # 11175 noise: max run=4 @ >=50%, ratio=10.9%. 8992 noise (v1.28): max run=9, worst-ratio=40%.
+    # v1.28: Wider SNR spectral gate ramp (8 dB) + L3-aligned formant settings. Noise bursts
+    # at 3-5 dB SNR still produce runs of 9 at >=50% due to structured HF noise peaks.
+    # Confirm gate raised to run>=10 (noise max=9 → 1 chunk margin) to block these.
+    # HFGCS EAMs are always multi-second → voice runs of 20+ chunks, easily clears run=10.
+    # Ratio gate at 0.30 provides secondary defense (noise worst=40% passes ratio but fails run).
     3: {"confidence_start": 50, "confidence_continue": 35, "confidence_stop": 42,
         "word_peak_threshold": 55, "post_roll_seconds": 10, "max_recording_duration": 300,
-        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 7,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 10,
         "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 5, "formant_prominence_db": 6.0,
         "flat_penalty_factor": 0.40, "min_formants": 1, "noise_floor_db": -60},
@@ -1567,29 +1570,31 @@ class OSINTCOMWindow(QMainWindow):
                 flat_penalty = preset.get("flat_penalty_factor", 0.40)
                 formant_score *= flat_penalty
             
-            # ===== v1.26 SNR GATE ON SPECTRAL SCORES =====
+            # ===== v1.28 SNR GATE ON SPECTRAL SCORES =====
             # Real-data finding (14405 kHz S8/S9 captures): HF voice sits only 0-4 dB
             # above the noise floor. The old multiplicative gate (ramp 0→1 over 0-5 dB)
             # was killing 96.9% of ALL spectral scores on real S8/S9 voice — making
             # formant and voiceband detection completely useless.
             #
-            # Fix: use a very soft gate. Only block spectral scores when SNR is deeply
-            # negative (< -3 dB = signal clearly below noise floor). Above -3 dB, pass
-            # through with a mild scale factor. The formant/voiceband structure itself
-            # provides the voice vs. noise discrimination — the gate just prevents
-            # crediting structure that can't possibly exist in pure silence.
+            # v1.28: Sensitivity-aware ramp width. L1-L2 keep 6 dB ramp (don't
+            # attenuate weak voice). L3+ use 8 dB ramp — at SNR 2.7 dB the gate is
+            # 0.59 instead of 0.78, cutting noise false positives observed on 8992.
+            # Real voice at 4 dB SNR: gate=0.75 — still scores well.
             #
             # Sensitivity-aware floor:
             #   L1: -4 dB  L2: -3 dB  L3: -2 dB  L4: -1 dB  L5: 0 dB
+            # Ramp widths:
+            #   L1: 6 dB  L2: 7 dB  L3: 8 dB  L4: 8 dB  L5: 9 dB
             snr_floors = {1: -4.0, 2: -3.0, 3: -2.0, 4: -1.0, 5: 0.0}
+            snr_ramps  = {1: 6.0, 2: 7.0, 3: 8.0, 4: 8.0, 5: 9.0}
             snr_floor = snr_floors.get(self._sensitivity_level, -2.0)
-            # Ramp over 6 dB above the floor — soft gate, not a cliff
+            snr_ramp  = snr_ramps.get(self._sensitivity_level, 8.0)
             if snr_percentile <= snr_floor:
                 snr_spectral_gate = 0.0
-            elif snr_percentile >= snr_floor + 6.0:
+            elif snr_percentile >= snr_floor + snr_ramp:
                 snr_spectral_gate = 1.0
             else:
-                snr_spectral_gate = (snr_percentile - snr_floor) / 6.0
+                snr_spectral_gate = (snr_percentile - snr_floor) / snr_ramp
             
             formant_score   *= snr_spectral_gate
             voiceband_score *= snr_spectral_gate
