@@ -78,22 +78,22 @@ SENSITIVITY_PRESETS = {
         "formant_threshold_db": 3, "formant_prominence_db": 3.5,
         "flat_penalty_factor": 0.65, "min_formants": 1, "noise_floor_db": -68},
     # Level 2: Very sensitive — good for weak/faint SSB/USB.
-    # Confirm gate: run=6 (noise max run at >=46% = 4 → blocked by 2 chunks).
+    # Confirm gate: run=11 (8992 noise max run at >=46% = 8 → blocked by 3 chunks margin).
+    # Ratio gate: 0.30 (8992 noise worst-window ratio = 40%... need both gates to block).
     # Hangover repin: run=3 — voice holds open with just 0.14s sustained above word_peak.
-    # This prevents fragmented recordings where confirm is strict but sustain is lenient.
     2: {"confidence_start": 46, "confidence_continue": 35, "confidence_stop": 48,
         "word_peak_threshold": 52, "post_roll_seconds": 10, "max_recording_duration": 480,
-        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.18, "confirm_min_run_chunks": 6,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 11,
         "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 4, "formant_prominence_db": 4.5,
         "flat_penalty_factor": 0.55, "min_formants": 1, "noise_floor_db": -65},
     # Level 3: Balanced (default) — data-validated for HFGCS frequencies.
-    # 11175 noise: max run=4 @ >=50%, ratio=10.9%. 8992 noise: max run=6, ratio=21.5%.
-    # Gates raised to cover worst observed HF band: run=7 (noise max=6), ratio=25% (noise max=21.5%).
+    # 11175 noise: max run=4 @ >=50%, ratio=10.9%. 8992 noise (new): max run=6, worst-ratio=27.7%.
+    # Gates: run=7 (noise max=6 → 1 chunk margin), ratio=0.30 (noise worst=27.7% → 2.3% margin).
     # Voice min word run at 21.5ch/s = 8+ chunks → passes both gates comfortably.
     3: {"confidence_start": 50, "confidence_continue": 35, "confidence_stop": 42,
         "word_peak_threshold": 55, "post_roll_seconds": 10, "max_recording_duration": 300,
-        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.25, "confirm_min_run_chunks": 7,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 7,
         "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 5, "formant_prominence_db": 6.0,
         "flat_penalty_factor": 0.40, "min_formants": 1, "noise_floor_db": -60},
