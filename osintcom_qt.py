@@ -47,32 +47,68 @@ BLOCK_SIZE = 2048
 PRE_ROLL_SECONDS = 5.0  # 5 seconds of audio before VAD triggers
 MIN_RECORDING_DURATION = 1.5
 
-# Formant-Primary VAD v1.25 — Sensitivity presets
+# Formant-Primary VAD v1.36 — Sensitivity presets
 # Scores voice 0-100: Formants(40) + VoiceBand(20) + SNR(15) + Pitch(15) + Modulation(10)
+# Thresholds calibrated from real HF captures (14405 kHz S8/S9 voice, 14000 kHz noise floor).
+# Key finding: S8/S9 voice SNR is only 0-4 dB above noise floor — all thresholds must be
+# reachable in that range. word_peak_threshold must be <= observed max confidence (~57%).
+#
+# v1.27 NB-noise baseline (11175 kHz, NB on, no voice): confidence EMA ≈ 41%.
+# Voice baseline (NB on, 14321 kHz): confidence EMA ≈ 43–44%.
+# confidence_stop is the EMA stop threshold: recording ends when EMA drops below this
+# after hangover expires. L3 stop=42 sits just above noise EMA (41%) and below voice EMA (43%).
+# max_recording_duration caps runaway false-positive recordings (seconds).
+# NB NOTE: Noise Blanker on your radio is recommended for best voice detection.
+#          With NB on a quiet/inactive frequency, use L3+ to avoid false triggers.
+# confirm_window_seconds:    how many seconds of audio chunks to observe (converted to chunk count).
+# confirm_min_ratio:          fraction of EXACTLY confirm_window_chunks that must be >= start_threshold.
+# confirm_min_run_chunks:     longest CONSECUTIVE run of frames >= threshold required to START recording.
+#   Using chunk count (not wall clock) makes the gate immune to audio callback batching.
+#   Data: 11175 noise max 7/64 hits, max run=3 — well below ratio=20% (13 hits) and run=5.
+# hangover_repin_run_chunks:  SEPARATE run gate used DURING recording to hold the hangover open.
+#   Decoupled from confirm_min_run_chunks so voice can sustain recording without needing
+#   the same strict run as confirm. Voice easily hits 3 consecutive frames; noise crashes
+#   (max run=4 at threshold) may occasionally tie this but EMA-stop still governs.
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity - catches very weak stations, may pass some noise
-    1: {"confidence_start": 40, "confidence_continue": 15, "confidence_stop": 5,
-        "word_peak_threshold": 60, "post_roll_seconds": 10,
+    # Level 1: Maximum sensitivity — catches very weak/faint stations, more false positives.
+    1: {"confidence_start": 35, "confidence_continue": 18, "confidence_stop": 36,
+        "word_peak_threshold": 42, "post_roll_seconds": 10, "max_recording_duration": 600,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.15, "confirm_min_run_chunks": 3,
+        "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 3, "formant_prominence_db": 3.5,
         "flat_penalty_factor": 0.65, "min_formants": 1, "noise_floor_db": -68},
-    # Level 2: Very sensitive - good for weak radio SSB/USB
-    2: {"confidence_start": 48, "confidence_continue": 20, "confidence_stop": 8,
-        "word_peak_threshold": 65, "post_roll_seconds": 10,
+    # Level 2: Very sensitive — good for weak/faint SSB/USB.
+    # Confirm gate: run=6 (noise max run at >=46% = 4 → blocked by 2 chunks).
+    # Hangover repin: run=3 — voice holds open with just 0.14s sustained above word_peak.
+    # This prevents fragmented recordings where confirm is strict but sustain is lenient.
+    2: {"confidence_start": 46, "confidence_continue": 35, "confidence_stop": 48,
+        "word_peak_threshold": 52, "post_roll_seconds": 10, "max_recording_duration": 480,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.18, "confirm_min_run_chunks": 6,
+        "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 4, "formant_prominence_db": 4.5,
         "flat_penalty_factor": 0.55, "min_formants": 1, "noise_floor_db": -65},
-    # Level 3: Balanced (default) - good rejection with reasonable sensitivity
-    3: {"confidence_start": 55, "confidence_continue": 30, "confidence_stop": 12,
-        "word_peak_threshold": 70, "post_roll_seconds": 10,
+    # Level 3: Balanced (default) — data-validated for HFGCS frequencies.
+    # 11175 noise: max run=4 @ >=50%, ratio=10.9%. 8992 noise: max run=6, ratio=21.5%.
+    # Gates raised to cover worst observed HF band: run=7 (noise max=6), ratio=25% (noise max=21.5%).
+    # Voice min word run at 21.5ch/s = 8+ chunks → passes both gates comfortably.
+    3: {"confidence_start": 50, "confidence_continue": 35, "confidence_stop": 42,
+        "word_peak_threshold": 55, "post_roll_seconds": 10, "max_recording_duration": 300,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.25, "confirm_min_run_chunks": 7,
+        "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 5, "formant_prominence_db": 6.0,
         "flat_penalty_factor": 0.40, "min_formants": 1, "noise_floor_db": -60},
-    # Level 4: Strict - requires strong formant validation
-    4: {"confidence_start": 65, "confidence_continue": 40, "confidence_stop": 15,
-        "word_peak_threshold": 75, "post_roll_seconds": 10,
+    # Level 4: Strict — requires strong formant + voiceband validation.
+    4: {"confidence_start": 60, "confidence_continue": 42, "confidence_stop": 47,
+        "word_peak_threshold": 65, "post_roll_seconds": 10, "max_recording_duration": 240,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.25, "confirm_min_run_chunks": 6,
+        "hangover_repin_run_chunks": 4,
         "formant_threshold_db": 7, "formant_prominence_db": 7.5,
         "flat_penalty_factor": 0.25, "min_formants": 2, "noise_floor_db": -55},
-    # Level 5: Voice only - strong formant + pitch requirement, minimum noise
-    5: {"confidence_start": 72, "confidence_continue": 50, "confidence_stop": 25,
-        "word_peak_threshold": 80, "post_roll_seconds": 10,
+    # Level 5: Voice only — strong signal required, minimum false positives.
+    5: {"confidence_start": 68, "confidence_continue": 50, "confidence_stop": 52,
+        "word_peak_threshold": 72, "post_roll_seconds": 10, "max_recording_duration": 180,
+        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 8,
+        "hangover_repin_run_chunks": 4,
         "formant_threshold_db": 8, "formant_prominence_db": 9.0,
         "flat_penalty_factor": 0.15, "min_formants": 2, "noise_floor_db": -50},
 }
@@ -603,8 +639,21 @@ class OSINTCOMWindow(QMainWindow):
         self._last_high_confidence_time = None  # Timestamp of last high confidence frame
         self._last_pitch_score = 0.0  # Store pitch score for voice-only detection
         self._hangover_remaining = 0.0  # Post-roll hangover countdown
+        self._hangover_voice_run = 0       # Consecutive frames >= word_peak_threshold (run gate)
         self._low_confidence_frames = 0  # Track consecutive low-confidence frames
         self._post_roll_silence_frames = 0  # Track silence during post-roll
+
+        # Confirmation-window state (v1.36 — chunk-count based, not wall-clock)
+        # A single frame above start_threshold enters CONFIRMING; recording only begins
+        # after BOTH confirm_min_ratio AND confirm_min_run_chunks are satisfied over
+        # exactly confirm_window_chunks chunks. Wall-clock is NOT used for the gate
+        # decision — this prevents audio-callback burst batching from spoofing the window.
+        self._confirming = False              # True while in CONFIRMING state
+        self._confirm_hit_count = 0           # Frames >= start_threshold seen so far
+        self._confirm_total_count = 0         # Total frames counted in window
+        self._confirm_current_run = 0         # Current consecutive-hit streak
+        self._confirm_max_run = 0             # Best consecutive-hit streak this window
+        self._confirm_start_time = None       # Wall-clock only for status-bar display
         
         # Audio processing settings
         self._audio_settings = {
@@ -716,9 +765,10 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.25")
+        version_label = QLabel("v1.36")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
+        version_label.setToolTip("OSINTCOM v1.36 — Chunk-count confirm gate (wall-clock exploit closed)\nDual gate: ratio + run over exactly N chunks. Enable NB — NEVER use NR")
         layout.addWidget(version_label)
         
         # Animated Ticker Display
@@ -789,7 +839,24 @@ class OSINTCOMWindow(QMainWindow):
         sens_row.addWidget(self.sens_slider)
         self.sens_label = QLabel(SENSITIVITY_LABELS[3])
         sens_row.addWidget(self.sens_label)
+        self.sens_slider.setToolTip(
+            "Sensitivity level for voice detection.\n"
+            "Tip: Enable Noise Blanker (NB) on your radio for best detection results.\n"
+            "Warning: Noise Reduction (NR) will suppress voice — keep NR OFF."
+        )
         audio_layout.addLayout(sens_row)
+
+        # NB/NR recommendation tip
+        nb_tip = QLabel("⚡ NB on  |  NR off  — for best voice detection")
+        nb_tip.setStyleSheet("color: #f0c040; font-size: 9px; padding: 1px 2px;")
+        nb_tip.setWordWrap(True)
+        nb_tip.setToolTip(
+            "Noise Blanker (NB): Enable on your radio — improves pitch detection on SSB.\n"
+            "Noise Reduction (NR): KEEP OFF — NR drops SNR by ~6dB and kills voice detection.\n"
+            "Validated on 3841, 3907, 3993, 11175, 11253, 14200 kHz captures."
+        )
+        audio_layout.addWidget(nb_tip)
+
         self.voice_label = QLabel("static")
         self.voice_label.setStyleSheet("color: red; font-weight: bold; font-size: 12px;")
         audio_layout.addWidget(self.voice_label)
@@ -1500,38 +1567,38 @@ class OSINTCOMWindow(QMainWindow):
                 flat_penalty = preset.get("flat_penalty_factor", 0.40)
                 formant_score *= flat_penalty
             
-            # ===== v1.25 SNR GATE ON SPECTRAL SCORES =====
-            # HF background noise always has spectral structure (peaks from QRM,
-            # multi-path, adjacent stations) — so formants and voiceband ALWAYS
-            # score full marks for noise, making them useless without this gate.
+            # ===== v1.26 SNR GATE ON SPECTRAL SCORES =====
+            # Real-data finding (14405 kHz S8/S9 captures): HF voice sits only 0-4 dB
+            # above the noise floor. The old multiplicative gate (ramp 0→1 over 0-5 dB)
+            # was killing 96.9% of ALL spectral scores on real S8/S9 voice — making
+            # formant and voiceband detection completely useless.
             #
-            # Fix: scale both scores by how far the signal is above the calibrated
-            # noise floor.  SNR=0dB (calibrated noise level) → scale=0, no credit.
-            # SNR≥6dB → full credit.  Ramps linearly between 0-6 dB.
+            # Fix: use a very soft gate. Only block spectral scores when SNR is deeply
+            # negative (< -3 dB = signal clearly below noise floor). Above -3 dB, pass
+            # through with a mild scale factor. The formant/voiceband structure itself
+            # provides the voice vs. noise discrimination — the gate just prevents
+            # crediting structure that can't possibly exist in pure silence.
             #
-            # Sensitivity-aware ramp top:
-            #   L1: 3 dB (very weak voice just needs to be slightly above noise)
-            #   L2: 4 dB
-            #   L3: 5 dB  (default)
-            #   L4: 6 dB
-            #   L5: 8 dB  (strict: needs clearly above-noise signal)
-            snr_ramp_tops = {1: 3.0, 2: 4.0, 3: 5.0, 4: 6.0, 5: 8.0}
-            snr_ramp_top = snr_ramp_tops.get(self._sensitivity_level, 5.0)
-            if snr_percentile <= 0.0:
+            # Sensitivity-aware floor:
+            #   L1: -4 dB  L2: -3 dB  L3: -2 dB  L4: -1 dB  L5: 0 dB
+            snr_floors = {1: -4.0, 2: -3.0, 3: -2.0, 4: -1.0, 5: 0.0}
+            snr_floor = snr_floors.get(self._sensitivity_level, -2.0)
+            # Ramp over 6 dB above the floor — soft gate, not a cliff
+            if snr_percentile <= snr_floor:
                 snr_spectral_gate = 0.0
-            elif snr_percentile >= snr_ramp_top:
+            elif snr_percentile >= snr_floor + 6.0:
                 snr_spectral_gate = 1.0
             else:
-                snr_spectral_gate = snr_percentile / snr_ramp_top
+                snr_spectral_gate = (snr_percentile - snr_floor) / 6.0
             
-            formant_score  *= snr_spectral_gate
+            formant_score   *= snr_spectral_gate
             voiceband_score *= snr_spectral_gate
             
             confidence += formant_score
             confidence += voiceband_score
             
             if debug:
-                print(f"  Voice Band: +{voiceband_score:.0f}pts  SNR gate: {snr_spectral_gate:.2f}")
+                print(f"  Voice Band: +{voiceband_score:.0f}pts  SNR gate: {snr_spectral_gate:.2f} (SNR={snr_percentile:.1f}dB floor={snr_floor:.0f}dB)")
             
             # ===== COMPONENT 4: PITCH DETECTION (15 points) =====
             pitch_score = self._detect_pitch(audio) if confidence > 10 else 0.0
@@ -1634,17 +1701,17 @@ class OSINTCOMWindow(QMainWindow):
             peak_idx = np.argmax(autocorr_pitch) if len(autocorr_pitch) > 0 else 0
             peak_strength = autocorr_pitch[peak_idx] if len(autocorr_pitch) > 0 else 0.0
             
-            # Calibrated from real FlexRadio SSB signal data:
-            # Silence: peak_strength 0.10-0.20 (0pts)
-            # Low voice: 0.22-0.50 (partial score)
-            # Strong voice: 0.45-0.87 (full score)
-            # Map: <=0.10 = 0pts, >=0.45 = 35pts, linear between
-            if peak_strength >= 0.45:
+            # Calibrated from real HF SSB captures (14405 kHz, FlexRadio DAX):
+            # SSB compresses voice — autocorr max observed was 0.298 on S8/S9 voice.
+            # Old threshold (>=0.45 for full score) was NEVER reachable on SSB.
+            # New thresholds: <=0.08 = 0pts (silence), >=0.25 = 35pts (SSB voice)
+            # Linear ramp 0.08→0.25. Anything above 0.25 is strong voice.
+            if peak_strength >= 0.25:
                 return 35.0
-            elif peak_strength <= 0.10:
+            elif peak_strength <= 0.08:
                 return 0.0
             else:
-                return (peak_strength - 0.10) / 0.35 * 35.0
+                return (peak_strength - 0.08) / 0.17 * 35.0
         except:
             return 0.0  # No credit on error — silence is safer than false positive
     
@@ -2098,21 +2165,29 @@ class OSINTCOMWindow(QMainWindow):
             if self._recording and confidence >= word_peak_threshold and confidence > 48:
                 self._last_word_peak_time = now
                 if self._meter_debug:
-                    print(f"[Word Peak] SUSTAINED {confidence:.0f}% >= {word_peak_threshold}% → reset post-roll")
-            
-            # Calculate time since last detected word
-            time_since_last_word = now - self._last_word_peak_time
-            post_roll_remaining = max(0, post_roll_seconds - time_since_last_word)
-            
-            # Hangover countdown: Decrement each frame (don't reinitialize once started)
+                    print(f"[Word Peak] SUSTAINED {confidence:.0f}% >= {word_peak_threshold}% → hangover held at {post_roll_seconds}s")
+
+            # Hangover run gate (v1.37): uses SEPARATE hangover_repin_run_chunks, decoupled
+            # from confirm_min_run_chunks. Confirm gate is strict (e.g. 6 chunks) to block noise
+            # before recording starts. Hangover repin is lenient (3 chunks = ~0.14s) so voice
+            # with natural dips/pauses can keep a recording open without needing a sustained
+            # 6-chunk run on every word — which caused fragmented/choppy recordings on Flex DAX.
             frame_duration = BLOCK_SIZE / self._sample_rate if hasattr(self, '_sample_rate') else 0.046
-            if self._recording and self._hangover_remaining > 0:
-                # Hangover active - just decrement, don't reinitialize
-                self._hangover_remaining = max(0, self._hangover_remaining - frame_duration)
-            elif self._recording and self._hangover_remaining == 0 and post_roll_remaining > 0 and not hasattr(self, '_hangover_started'):
-                # Initialize hangover only ONCE when entering post-roll window
-                self._hangover_started = True
-                self._hangover_remaining = post_roll_remaining
+            hangover_repin_run = preset.get("hangover_repin_run_chunks", 3)
+            if self._recording:
+                if confidence >= word_peak_threshold and confidence > 48:
+                    self._hangover_voice_run += 1
+                else:
+                    self._hangover_voice_run = 0
+
+                if self._hangover_voice_run >= hangover_repin_run:
+                    # Sustained voice — hold hangover at full post-roll duration
+                    self._hangover_remaining = float(post_roll_seconds)
+                    if self._meter_debug and self._hangover_voice_run == hangover_repin_run:
+                        print(f"[HANGOVER HELD] Sustained voice run={self._hangover_voice_run} chunks (need>={hangover_repin_run}), reset to {post_roll_seconds}s")
+                elif self._hangover_remaining > 0:
+                    # No sustained voice — count down
+                    self._hangover_remaining = max(0.0, self._hangover_remaining - frame_duration)
             
             # DEBUG: Show state every ~0.5s
             if self._meter_debug and not hasattr(self, '_last_debug_print'):
@@ -2129,15 +2204,15 @@ class OSINTCOMWindow(QMainWindow):
             
             # Use preset thresholds instead of hardcoded values
             if self._recording and self._hangover_remaining > 0:
-                # During post-roll/hangover: stricter to avoid extending on noise
-                threshold_for_accumulate = word_peak_threshold  # Uses preset (60-80)
+                # During hangover: use word_peak_threshold to keep hangover alive if voice returns
+                threshold_for_accumulate = word_peak_threshold
             elif self._recording:
                 # During normal recording: use continue threshold from preset
-                threshold_for_accumulate = continue_threshold  # Uses preset (15-50)
+                threshold_for_accumulate = continue_threshold
             else:
                 # Before recording: use start threshold from preset
-                threshold_for_accumulate = start_threshold  # Uses preset (40-72)
-            
+                threshold_for_accumulate = start_threshold
+
             # Voice confidence accumulator - tracks total voice time for upload validation
             if confidence > threshold_for_accumulate:
                 # Accumulate high-confidence time
@@ -2148,65 +2223,28 @@ class OSINTCOMWindow(QMainWindow):
                     dt = time.time() - self._last_high_confidence_time
                     self._voice_confidence_duration += dt
                     self._last_high_confidence_time = time.time()
-                # Reset low-confidence frame counter when we see high confidence
-                if not hasattr(self, '_low_confidence_frames'):
-                    self._low_confidence_frames = 0
                 self._low_confidence_frames = 0
-                
-                # During post-roll: Reset post-roll silence counter when voice returns
-                if self._recording and self._hangover_remaining > 0:
-                    if not hasattr(self, '_post_roll_silence_frames'):
-                        self._post_roll_silence_frames = 0
-                    self._post_roll_silence_frames = 0
-                
-                # Reset hangover if we're ALREADY in post-roll and detect NEW voice
-                # BUT only if SNR, confidence, AND pitch are sufficient - prevents noise from extending recording
-                if self._recording and self._hangover_remaining > 0:
-                    snr_now = getattr(self, '_last_snr_db', 0.0)
-                    pitch_score = getattr(self, '_last_pitch_score', 0.0)
-                    # Require SNR > 5.5dB AND confidence > 65% AND pitch >= 15pts to reset hangover
-                    # Strict filtering prevents noise from extending recordingk
-                    if snr_now > 5.5 and confidence > 65 and pitch_score >= 15.0:
-                        # Strong signal AND clear voice with pitch - confirmed real transmission, reset hangover
-                        self._hangover_remaining = post_roll_seconds
-                        if self._meter_debug:
-                            print(f"[FOLLOW-UP] New voice detected (Conf={confidence:.0f}%, SNR={snr_now:.1f}dB, Pitch={pitch_score:.0f}pts) - reset to {post_roll_seconds}s")
-                    elif self._meter_debug and (snr_now > 5.5 or confidence > 65):
-                        print(f"[HANGOVER] Signal (Conf={confidence:.0f}%, SNR={snr_now:.1f}dB, Pitch={pitch_score:.0f}pts) doesn't meet all criteria - ignoring")
             else:
                 # Low confidence frame
-                if not hasattr(self, '_low_confidence_frames'):
-                    self._low_confidence_frames = 0
                 self._low_confidence_frames += 1
-                
-                # During post-roll: Track sustained silence specifically
-                if self._recording and self._hangover_remaining > 0:
-                    if not hasattr(self, '_post_roll_silence_frames'):
-                        self._post_roll_silence_frames = 0
-                    # Only count frames significantly below voice threshold (< 52% = reliable noise)
-                    if confidence < 52:
-                        self._post_roll_silence_frames += 1
-                    else:
-                        # Reset if confidence recovers above 52% (likely new voice in post-roll)
-                        self._post_roll_silence_frames = 0
-                else:
-                    # Not in post-roll, reset post-roll silence counter
-                    if hasattr(self, '_post_roll_silence_frames'):
-                        self._post_roll_silence_frames = 0
-                
-                # Preserve voice duration accumulation - NEVER reset during idle
-                # Duration only resets after recording finalized or 5+ seconds of continuous silence
+                # Preserve voice duration — reset only after 5s of continuous idle silence
                 if not self._recording and self._last_high_confidence_time is not None:
-                    # Check if we've been silent for more than 5 seconds
-                    time_since_last_voice = time.time() - self._last_high_confidence_time
-                    if time_since_last_voice > 5.0:
-                        # Reset only after extended silence
+                    if time.time() - self._last_high_confidence_time > 5.0:
                         self._voice_confidence_duration = 0.0
                         self._last_high_confidence_time = None
             
             # Voice is detected if confidence exceeds threshold OR we're in hangover window
             # Convert to native Python bool to avoid numpy.bool_ type issues
-            voice_detected = bool(confidence > threshold_for_accumulate) or bool(self._hangover_remaining > 0)
+            # v1.27: After hangover expires, use EMA-smoothed confidence for the stop decision.
+            # EMA(alpha=0.25) ≈ 168ms time constant prevents single quiet frames from killing a recording,
+            # while simultaneously preventing NB-processed noise (EMA ≈41%) from holding recordings
+            # open indefinitely when stop_threshold (L3=42%) sits just above the noise EMA.
+            if self._hangover_remaining > 0:
+                voice_detected = True
+            elif self._recording:
+                voice_detected = bool(self._confidence_ema > stop_threshold)
+            else:
+                voice_detected = bool(confidence >= start_threshold)
             voice_detected = bool(voice_detected)  # Ensure native Python bool
             snr_display = getattr(self, '_last_snr_db', -60.0)
             
@@ -2214,26 +2252,100 @@ class OSINTCOMWindow(QMainWindow):
             snr_now = getattr(self, '_last_snr_db', 0.0)
             pitch_score = getattr(self, '_last_pitch_score', 0.0)
             
-            # Use preset start threshold (40-72 depending on sensitivity level)
-            if not self._recording and confidence >= start_threshold:
-                if self._meter_debug:
-                    print(f">>> RECORDING START <<< Score {confidence:.0f}/100 >= {start_threshold}%, SNR={snr_now:.1f}dB, Pitch={pitch_score:.0f}pts")
-                self._start_recording()
-                self.status_bar.showMessage(f"Recording started | Voice detected (SNR={snr_display:.1f}dB)")
-            
+            # CONFIRMING / START RECORDING state machine (v1.36 — chunk-count window)
+            # IDLE: single frame >= start_threshold → enter CONFIRMING (no file opened yet).
+            # CONFIRMING: accumulate EXACTLY confirm_window_chunks frames, then evaluate gates.
+            # Gate fires only after N chunks — wall clock is NOT used for the gate decision.
+            # This prevents audio-callback burst batching from spoofing the window:
+            # a noise burst of 6 frames arriving in 0.1s can't satisfy a 65-chunk window.
+            # Data: 11175 noise max 7/65 hits (10.8%), max run=3 → both gates stay closed.
+            confirm_window_secs   = preset.get("confirm_window_seconds", 3.0)
+            confirm_ratio         = preset.get("confirm_min_ratio", 0.20)
+            confirm_min_run       = preset.get("confirm_min_run_chunks", 5)
+            sr = getattr(self, '_sample_rate', 44100)
+            confirm_window_chunks = max(10, round(confirm_window_secs * sr / BLOCK_SIZE))
+
+            if not self._recording and not self._confirming:
+                if confidence >= start_threshold:
+                    # Enter CONFIRMING — do not open a file yet
+                    self._confirming = True
+                    self._confirm_start_time = now  # wall clock for display only
+                    self._confirm_hit_count = 1
+                    self._confirm_total_count = 1
+                    self._confirm_current_run = 1
+                    self._confirm_max_run = 1
+                    self.status_bar.showMessage(f"Confirming voice... ({confidence:.0f}%)")
+                    if self._meter_debug:
+                        print(f">>> CONFIRMING <<< Score {confidence:.0f}/100 >= {start_threshold}%  window={confirm_window_chunks}chk")
+
+            elif not self._recording and self._confirming:
+                self._confirm_total_count += 1
+                if confidence >= start_threshold:
+                    self._confirm_hit_count += 1
+                    self._confirm_current_run += 1
+                    if self._confirm_current_run > self._confirm_max_run:
+                        self._confirm_max_run = self._confirm_current_run
+                else:
+                    self._confirm_current_run = 0  # streak broken
+                ratio_now = self._confirm_hit_count / self._confirm_total_count
+
+                # Gate fires after exactly confirm_window_chunks frames — no wall-clock shortcut
+                if self._confirm_total_count >= confirm_window_chunks:
+                    passes_ratio = ratio_now >= confirm_ratio
+                    passes_run   = self._confirm_max_run >= confirm_min_run
+                    if passes_ratio and passes_run:
+                        # Both gates passed — this is real voice, start recording
+                        if self._meter_debug:
+                            print(f">>> RECORDING START <<< {self._confirm_hit_count}/{self._confirm_total_count}chk ratio={ratio_now:.0%}>={confirm_ratio:.0%}, run={self._confirm_max_run}>={confirm_min_run}")
+                        self._confirming = False
+                        self._confirm_hit_count = 0
+                        self._confirm_total_count = 0
+                        self._confirm_current_run = 0
+                        self._confirm_max_run = 0
+                        self._start_recording()
+                        self.status_bar.showMessage(f"Recording started | Voice confirmed (SNR={snr_display:.1f}dB)")
+                    else:
+                        # At least one gate failed — discard as noise crash or blip
+                        reason = []
+                        if not passes_ratio: reason.append(f"ratio {ratio_now:.0%}<{confirm_ratio:.0%}")
+                        if not passes_run:   reason.append(f"run {self._confirm_max_run}<{confirm_min_run}chk")
+                        blip_info = ", ".join(reason)
+                        if self._meter_debug:
+                            print(f">>> DISCARDED <<< {blip_info}")
+                        self._confirming = False
+                        self._confirm_hit_count = 0
+                        self._confirm_total_count = 0
+                        self._confirm_current_run = 0
+                        self._confirm_max_run = 0
+                        self.status_bar.showMessage(f"Discarded ({blip_info})")
+                else:
+                    # Still accumulating — show live chunk-based progress
+                    pct = int(100 * self._confirm_total_count / confirm_window_chunks)
+                    self.status_bar.showMessage(
+                        f"Confirming... ({self._confirm_hit_count}/{self._confirm_total_count}chk {pct}%, run={self._confirm_max_run}/{confirm_min_run})"
+                    )
+
             # CONTINUE RECORDING - while voice is detected (threshold met or in hangover)
             elif self._recording:
-                if voice_detected:
+                # Safety cap: enforce max_recording_duration from preset
+                rec_duration = (now - self._voice_started_at) if self._voice_started_at else 0
+                max_rec_dur = preset.get("max_recording_duration", 300)
+                if rec_duration >= max_rec_dur:
+                    if self._meter_debug:
+                        print(f">>> RECORDING STOP <<< Max duration {max_rec_dur}s reached")
+                    self._finalize_recording()
+                    self.status_bar.showMessage(f"Recording stopped | Max duration reached ({max_rec_dur:.0f}s)")
+                elif voice_detected:
                     # Still recording - voice or within hangover window
                     self.status_bar.showMessage(
-                        f"Recording... | Score: {confidence:.0f}/100 | Accumulated: {self._voice_confidence_duration:.1f}s | Hangover: {self._hangover_remaining:.2f}s"
+                        f"Recording... | Score: {confidence:.0f}/100 | EMA: {self._confidence_ema:.0f}% | Hangover: {self._hangover_remaining:.2f}s"
                     )
                 else:
-                    # Hangover expired with no voice - STOP RECORDING
+                    # EMA dropped below stop_threshold after hangover — STOP RECORDING
                     if self._meter_debug:
-                        print(f">>> RECORDING STOP <<< Hangover expired")
+                        print(f">>> RECORDING STOP <<< EMA {self._confidence_ema:.0f}% <= stop {stop_threshold}%")
                     self._finalize_recording()
-                    self.status_bar.showMessage(f"Recording stopped | Hangover timeout")
+                    self.status_bar.showMessage(f"Recording stopped | EMA {self._confidence_ema:.0f}% below threshold")
             
             # Update voice indicator  
             if voice_detected != self._voice_detected:
@@ -2243,19 +2355,40 @@ class OSINTCOMWindow(QMainWindow):
 
 
     def _start_recording(self):
+        # Safety: clear any dangling confirming state
+        self._confirming = False
+        self._confirm_start_time = None
+        self._confirm_hit_count = 0
+        self._confirm_total_count = 0
+        self._confirm_current_run = 0
+        self._confirm_max_run = 0
         self._voice_started_at = time.time()
         self._voice_silence_at = None
         self._silence_timer_remaining = 0
-        
+
         # CRITICAL FIX: Reset confidence duration accumulator when recording starts
         # This ensures only voice time DURING recording counts, not static accumulated before
         self._voice_confidence_duration = 0.0
         self._last_high_confidence_time = None
         
         # Track that voice was confirmed
-        self._last_confirmed_voice_time = time.time()
+        now = time.time()
+        self._last_confirmed_voice_time = now
         
-        # Clear hangover tracking flags for fresh hangover window
+        # HANGOVER FIX: Seed _last_word_peak_time to NOW so the full post-roll window
+        # is available immediately when recording starts. Without this, the word-peak
+        # timer starts at (now - post_roll_seconds), making post_roll_remaining = 0
+        # and hangover never initialises on faint signals that never hit word_peak_threshold.
+        self._last_word_peak_time = now
+
+        # Seed hangover to full post-roll duration immediately — voice was just confirmed
+        # via the 3s dual-gate, so it deserves the full window from the start.
+        # Also pre-prime _hangover_voice_run to hangover_repin_run_chunks so the VERY FIRST
+        # voice frame holds the hangover rather than needing to rebuild a run from scratch.
+        # Without this: hangover=0 at start, EMA dip in opening frames closes the file.
+        _preset = SENSITIVITY_PRESETS.get(self._sensitivity_level, SENSITIVITY_PRESETS[3])
+        self._hangover_remaining = float(_preset.get("post_roll_seconds", 10))
+        self._hangover_voice_run = _preset.get("hangover_repin_run_chunks", 3)  # pre-primed
         if hasattr(self, '_hangover_started'):
             delattr(self, '_hangover_started')
         self._post_roll_silence_frames = 0
@@ -2275,12 +2408,21 @@ class OSINTCOMWindow(QMainWindow):
         self._signals.recording.emit(True)  # Trigger animation start
 
     def _finalize_recording(self):
+        # Reset confirmation state (safety — may be mid-confirm when forced-stop)
+        self._confirming = False
+        self._confirm_start_time = None
+        self._confirm_hit_count = 0
+        self._confirm_total_count = 0
+        self._confirm_current_run = 0
+        self._confirm_max_run = 0
         self._recording = False
         self._voice_started_at = None
         self._voice_silence_at = None
         self._signals.recording.emit(False)  # Stop animation
-        
-        # Clear hangover flag for next recording cycle
+
+        # Reset hangover completely so voice LED clears and next recording starts clean
+        self._hangover_remaining = 0.0
+        self._hangover_voice_run = 0
         if hasattr(self, '_hangover_started'):
             delattr(self, '_hangover_started')
         
