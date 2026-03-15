@@ -51,8 +51,8 @@ OUTPUT_DIR    = os.path.join(os.path.dirname(__file__), "hf_captures")
 
 # ── Sensitivity presets (mirrors osintcom_qt.py) ─────────────────────────────
 SENSITIVITY_PRESETS = {
-    1: {"confidence_start": 35, "confirm_min_ratio": 0.15, "confirm_min_run_chunks": 3,
-        "confirm_window_seconds": 3.0,
+    1: {"confidence_start": 42, "confirm_min_ratio": 0.40, "confirm_min_run_chunks": 16,
+        "confirm_window_seconds": 5.0,
         "formant_threshold_db": 3, "formant_prominence_db": 3.5,
         "flatness_gate": 0.80, "vb_flatness_hi": 0.82, "vb_flatness_lo": 0.40,
         "snr_gate_ramp_db": 6.0},

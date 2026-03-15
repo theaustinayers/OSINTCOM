@@ -70,10 +70,13 @@ MIN_RECORDING_DURATION = 1.5
 #   the same strict run as confirm. Voice easily hits 3 consecutive frames; noise crashes
 #   (max run=4 at threshold) may occasionally tie this but EMA-stop still governs.
 SENSITIVITY_PRESETS = {
-    # Level 1: Maximum sensitivity — catches very weak/faint stations, more false positives.
-    1: {"confidence_start": 35, "confidence_continue": 18, "confidence_stop": 36,
-        "word_peak_threshold": 42, "post_roll_seconds": 10, "max_recording_duration": 600,
-        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.15, "confirm_min_run_chunks": 3,
+    # Level 1: Maximum sensitivity — catches very weak/faint stations.
+    # Data-validated: 8992 noise at >=42%: max_run=8, w-ratio=18.3%. 15016: run=12, ratio=30.8%.
+    # Confirm gate: run>=16 blocks both (8992: 8<16, 15016: 12<16). Ratio>=0.40 secondary defense.
+    # Window 5.0s (117 chunks) for stable averaging. Real weak voice: run=20-40+, ratio>50%.
+    1: {"confidence_start": 42, "confidence_continue": 18, "confidence_stop": 36,
+        "word_peak_threshold": 48, "post_roll_seconds": 10, "max_recording_duration": 600,
+        "confirm_window_seconds": 5.0, "confirm_min_ratio": 0.40, "confirm_min_run_chunks": 16,
         "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 3, "formant_prominence_db": 3.5,
         "flat_penalty_factor": 0.65, "min_formants": 1, "noise_floor_db": -68},
