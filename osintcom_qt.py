@@ -78,12 +78,14 @@ SENSITIVITY_PRESETS = {
         "formant_threshold_db": 3, "formant_prominence_db": 3.5,
         "flat_penalty_factor": 0.65, "min_formants": 1, "noise_floor_db": -68},
     # Level 2: Very sensitive — good for weak/faint SSB/USB.
-    # Confirm gate: run=11 (8992 noise max run at >=46% = 8 → blocked by 3 chunks margin).
-    # Ratio gate: 0.30 (8992 noise worst-window ratio = 40%... need both gates to block).
+    # Confirm gate: run=14 (15016 noise at L2 scoring: estimated max run ~10-12 → 2+ margin).
+    #   Previously run=11; 8992 was fine but 15016 structured noise could reach 10-12 runs.
+    # Ratio gate: 0.35 (15016 noise worst-window ratio ~25-30% at L2 → blocked).
     # Hangover repin: run=3 — voice holds open with just 0.14s sustained above word_peak.
+    # Window widened to 4.0s (93 chunks @ 44.1kHz) — more samples to average out noise bursts.
     2: {"confidence_start": 46, "confidence_continue": 35, "confidence_stop": 48,
         "word_peak_threshold": 52, "post_roll_seconds": 10, "max_recording_duration": 480,
-        "confirm_window_seconds": 3.0, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 11,
+        "confirm_window_seconds": 4.0, "confirm_min_ratio": 0.35, "confirm_min_run_chunks": 14,
         "hangover_repin_run_chunks": 3,
         "formant_threshold_db": 4, "formant_prominence_db": 4.5,
         "flat_penalty_factor": 0.55, "min_formants": 1, "noise_floor_db": -65},

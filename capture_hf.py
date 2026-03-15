@@ -56,8 +56,8 @@ SENSITIVITY_PRESETS = {
         "formant_threshold_db": 3, "formant_prominence_db": 3.5,
         "flatness_gate": 0.80, "vb_flatness_hi": 0.82, "vb_flatness_lo": 0.40,
         "snr_gate_ramp_db": 6.0},
-    2: {"confidence_start": 46, "confirm_min_ratio": 0.30, "confirm_min_run_chunks": 11,
-        "confirm_window_seconds": 3.0,
+    2: {"confidence_start": 46, "confirm_min_ratio": 0.35, "confirm_min_run_chunks": 14,
+        "confirm_window_seconds": 4.0,
         "formant_threshold_db": 4, "formant_prominence_db": 4.5,
         "flatness_gate": 0.76, "vb_flatness_hi": 0.65, "vb_flatness_lo": 0.35,
         "snr_gate_ramp_db": 7.0},
@@ -108,13 +108,13 @@ def bar(value_0_1, width=40):
     return "[" + "█" * filled + "░" * (width - filled) + "]"
 
 
-# ── Lightweight VAD scorer (mirrors osintcom_qt.py v1.27 logic) ──────────────
+# ── Lightweight VAD scorer (mirrors osintcom_qt.py v1.36 logic) ──────────────
 
 class LightVAD:
     """
     Stripped-down version of the main-app VAD for offline scoring.
     Returns a dict of component scores per audio chunk.
-    Now sensitivity-aware: mirrors osintcom_qt.py formant/voiceband settings.
+    Sensitivity-aware: mirrors osintcom_qt.py formant/voiceband/SNR settings.
     """
     def __init__(self, sample_rate=48000, sensitivity=3):
         self.sr = sample_rate
@@ -134,9 +134,8 @@ class LightVAD:
         self._snr_history.append(snr)
         rms_db = 20 * np.log10(rms + 1e-10)
 
-        # SNR score (0-15) — matches v1.27: threshold=-2dB, full at threshold+10dB
-        # (same as main app during active recording state)
-        snr_threshold = -2.0
+        # SNR score (0-15) — matches main app idle state: threshold=0dB, full at +10dB
+        snr_threshold = 0.0
         if snr < snr_threshold:
             snr_score = 0.0
         elif snr > snr_threshold + 10.0:
@@ -157,11 +156,11 @@ class LightVAD:
             flat_penalties = {1: 0.65, 2: 0.55, 3: 0.40, 4: 0.25, 5: 0.15}
             formant_score *= flat_penalties.get(self._sensitivity, 0.40)
 
-        # SNR spectral gate — sensitivity-aware floor & ramp
-        # L3 ramp=8dB (was 6): requires more SNR before giving full spectral credit.
-        # At 2.7dB SNR with L3: gate = (2.7+2)/8 = 0.59 (was 0.78 with 6dB ramp).
-        snr_floor = -2.0
-        snr_ramp  = self._preset.get("snr_gate_ramp_db", 8.0)
+        # SNR spectral gate — sensitivity-aware floor & ramp (matches main app per-level)
+        snr_floors = {1: -4.0, 2: -3.0, 3: -2.0, 4: -1.0, 5: 0.0}
+        snr_ramps  = {1: 6.0, 2: 7.0, 3: 8.0, 4: 8.0, 5: 9.0}
+        snr_floor = snr_floors.get(self._sensitivity, -2.0)
+        snr_ramp  = snr_ramps.get(self._sensitivity, 8.0)
         if snr <= snr_floor:
             gate = 0.0
         elif snr >= snr_floor + snr_ramp:
@@ -246,12 +245,28 @@ class LightVAD:
             n = len(clusters)
 
             if n >= 2:
-                span = clusters[-1][-1] - clusters[0][0]
+                centers = [np.mean(c) for c in clusters]
+                span = max(centers) - min(centers)
                 if span < 400:
                     n = 1
 
-            score_map = {0: 0.0, 1: 12.0, 2: 27.0}
-            score = score_map.get(n, min(max_pts, 27 + (n - 2) * 6.5))
+            # Tightness-aware single-cluster scoring (matches main app)
+            if n == 1:
+                bw = max(clusters[0]) - min(clusters[0]) if len(clusters[0]) > 1 else 0.0
+                if bw <= 150.0:
+                    score = 22.0   # Extremely tight — weak SSB voice
+                elif bw <= 250.0:
+                    score = 17.0   # Tight — typical single formant
+                else:
+                    score = 10.0   # Loose single cluster
+            elif n == 2:
+                score = 22.0
+            elif n == 3:
+                score = 36.0
+            elif n >= 4:
+                score = max_pts
+            else:
+                score = 0.0
             return score, n
         except:
             return 0.0, 0
@@ -320,10 +335,10 @@ class LightVAD:
 
 # ── Main capture loop ────────────────────────────────────────────────────────
 
-def run_capture(device_idx: int, session_name: str, duration_min: float):
+def run_capture(device_idx: int, session_name: str, duration_min: float, sensitivity: int = 3):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    ts        = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts        = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     wav_path  = os.path.join(OUTPUT_DIR, f"{session_name}_{ts}.wav")
     csv_path  = os.path.join(OUTPUT_DIR, f"{session_name}_{ts}_vad.csv")
 
@@ -331,7 +346,7 @@ def run_capture(device_idx: int, session_name: str, duration_min: float):
     sr          = int(device_info['default_samplerate'])
     total_sec   = duration_min * 60.0
 
-    vad         = LightVAD(sample_rate=sr, sensitivity=3)
+    vad         = LightVAD(sample_rate=sr, sensitivity=sensitivity)
     audio_chunks = []
     csv_rows     = []
     lock         = threading.Lock()
@@ -387,6 +402,7 @@ def run_capture(device_idx: int, session_name: str, duration_min: float):
     # ── Print header ──
     print(f"  Session : {session_name}")
     print(f"  Device  : [{device_idx}] {device_info['name']} @ {sr} Hz")
+    print(f"  VAD     : L{sensitivity} sensitivity")
     print(f"  Duration: {duration_min:.0f} min  ({total_sec:.0f} s)")
     print(f"  WAV     : {wav_path}")
     print(f"  CSV     : {csv_path}")
@@ -460,7 +476,7 @@ def run_capture(device_idx: int, session_name: str, duration_min: float):
     # ── Quick summary + confirm-gate simulation ──
     confs = [r["confidence"] for r in csv_rows]
     if confs:
-        print(f"\n  ── VAD Summary ────────────────────────────────────────────")
+        print(f"\n  ── VAD Summary (scored at L{sensitivity}) ──────────────────────────────")
         print(f"  Chunks recorded : {len(confs)}")
         print(f"  Confidence  avg : {np.mean(confs):.1f}%")
         print(f"  Confidence  max : {np.max(confs):.1f}%")
@@ -527,7 +543,7 @@ DEFAULT_DEVICE = 7   # DAX Audio RX 1 (FlexRadio SmartSDR)
 
 def main():
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║     OSINTCOM HF Capture Tool  — VAD Training Aid  v1.28     ║")
+    print("║     OSINTCOM HF Capture Tool  — VAD Training Aid  v1.36     ║")
     print("╚══════════════════════════════════════════════════════════════╝")
 
     devices = list_devices()
@@ -555,7 +571,14 @@ def main():
     except ValueError:
         duration = 60.0
 
-    run_capture(device_idx, session, duration)
+    sens_raw = input("  Sensitivity level 1-5 [3]: ").strip()
+    try:
+        sens = max(1, min(5, int(sens_raw))) if sens_raw else 3
+    except ValueError:
+        sens = 3
+    print(f"  VAD sensitivity: L{sens}")
+
+    run_capture(device_idx, session, duration, sensitivity=sens)
 
 
 if __name__ == "__main__":
