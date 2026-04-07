@@ -1,8 +1,8 @@
-# OSINTCOM v1.13
+# OSINTCOM v1.4
 
 **Professional-grade Voice Activity Detection (VAD) and recording system for HF radio SSB monitoring with intelligent noise rejection and Discord integration.**
 
-![OSINTCOM v1.13 Interface](screenshot.png)
+![OSINTCOM v1.4 Interface](screenshot.png)
 
 ---
 
@@ -322,6 +322,12 @@ Output: `dist/OSINTCOM.exe` (~117 MB, includes all dependencies)
 ---
 
 ## Version History
+
+### v1.4 (April 2026)
+- 🔧 Tightened L1/L2/L3 confirm gates against HFGCS band noise
+- 🔧 Chunk-count confirm gate — wall-clock exploit closed
+- 🔧 Decoupled hangover repin for cleaner recordings
+- 🔧 LightVAD scoring sync for L2 false positive reduction
 
 ### v1.13 (March 2026)
 - ✨ **Animated alert ticker** with ShareTechMono font

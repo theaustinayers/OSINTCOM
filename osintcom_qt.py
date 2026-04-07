@@ -773,10 +773,10 @@ class OSINTCOMWindow(QMainWindow):
         layout.addWidget(title)
         
         # Version Label
-        version_label = QLabel("v1.36")
+        version_label = QLabel("v1.4")
         version_label.setAlignment(Qt.AlignCenter)
         version_label.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
-        version_label.setToolTip("OSINTCOM v1.36 — Chunk-count confirm gate (wall-clock exploit closed)\nDual gate: ratio + run over exactly N chunks. Enable NB — NEVER use NR")
+        version_label.setToolTip("OSINTCOM v1.4 — Enhanced VAD with chunk-count confirm gate\nDual gate: ratio + run over exactly N chunks. Enable NB — NEVER use NR")
         layout.addWidget(version_label)
         
         # Animated Ticker Display

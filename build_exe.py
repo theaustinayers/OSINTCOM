@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build script for OSINTCOM v1.0
+Build script for OSINTCOM v1.4
 Generates a standalone Windows .exe using PyInstaller
 
 Usage: python build_exe.py
@@ -17,7 +17,7 @@ def build():
     icon_path = os.path.join(project_dir, "icon.ico")
     
     print("=" * 60)
-    print("OSINTCOM v1.0 - PyInstaller Build")
+    print("OSINTCOM v1.4 - PyInstaller Build")
     print("=" * 60)
     
     # PyInstaller arguments
